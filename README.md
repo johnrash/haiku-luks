@@ -36,6 +36,23 @@ RFCs. It's all MIT-licensed.
 > the Haiku project. "Haiku" and the Haiku logo are trademarks of Haiku,
 > Inc.
 
+## Screenshots
+
+The EFI boot loader asks for the passphrase of the encrypted system volume
+(Esc opens the boot menu instead):
+
+![The boot loader's passphrase prompt for the encrypted volume "Haiku HD"](docs/images/boot-passphrase-prompt.png)
+
+DriveSetup's Partition → Encrypt… makes a LUKS2 volume out of a partition:
+
+![DriveSetup's Encrypt partition dialog, with fields for the volume name and the passphrase](docs/images/drivesetup-encrypt-dialog.png)
+
+DriveSetup on an encrypted install. The LUKS2 partition is typed "Linux
+LUKS", and its unlocked volume, `/dev/disk/virtual/luks/0/raw`, holds the
+Be File System mounted at `/boot`:
+
+![DriveSetup listing the EFI partition, the LUKS2 encrypted partition and the unlocked boot volume](docs/images/drivesetup-encrypted-volume.png)
+
 ## Status
 
 - **x86_64, UEFI:** built and tested. Tested in QEMU (OVMF, NVMe disks)
@@ -100,6 +117,7 @@ disk.
 | `docs/BUILDING.md` | Applying, building, testing |
 | `docs/USING.md` | Using encrypted volumes |
 | `docs/DESIGN.md` | Design, reviews, test results, limits |
+| `docs/images/` | The screenshots above |
 
 ## Licences
 
