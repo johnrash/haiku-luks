@@ -10,7 +10,7 @@ stages:
 - the fixes from the first tries on real hardware, patches 0008, 0010 and
   0011;
 - two fixes outside the LUKS code, found on the way, patches 0012 and 0013;
-- two test script fixes, patches 0006 and 0009;
+- three test script fixes, patches 0006, 0009 and 0016;
 - two changes for current Haiku `master`, patches 0014 and 0015.
 
 The common code is written so that arm64, which boots through the same
@@ -483,19 +483,26 @@ otherwise. The scripts are in `src/tests/system/luks2` (its `README.md`
 describes each).
 
 The table's results are from the work's original base (Haiku `master` of
-late October 2026). On `master` a8694efb7c (2026-11-12) with all 15
-patches, on 2026-11-13:
+late October 2026). On `master` a8694efb7c (2026-11-12), on 2026-11-13:
 - **Same results:** the host tests (both builds), the driver test and the
   loader test.
-- **The boot test:** each of its checks passed in at least one of three
-  runs. The boots that failed hit one of the two problems of stock Haiku
-  described at the end of `BUILDING.md`, section 4:
+- **Patches 0001-0015:** each of the boot test's checks passed in at least
+  one of three runs. The UI test's live system passed its 25 checks, and
+  the host's checks passed. The installed disk's boot passed once. The
+  boots that failed hit one of two problems of stock Haiku, described at
+  the end of `BUILDING.md`, section 4:
   - a deadlock between net_server and launch_daemon;
   - the kernel switching its serial output off when the UART stays busy
     too long. The guest carries on, but the test can't see its result.
-- **The UI test:** the live system's 25 checks and the host's checks
-  passed. The installed disk's boot passed once. In a second run its
-  serial output went quiet the same way.
+    Patch 0016 puts the tests' serial port on a file instead of a socket,
+    which avoids it.
+- **All 16 patches:** the boot test passed 19 of 19, and the loader test
+  8 of 8. The UI test's live system passed its 25 checks, and so did the
+  host's checks of Installer's EFI loader and the partition type. The
+  installed disk's first boot hung after package_daemon's "is consistent"
+  lines, where the deadlock hangs; that hang wasn't captured to confirm
+  it. The same disk then booted 4 more times and passed its checks each
+  time.
 
 | What | How | Result |
 |---|---|---|

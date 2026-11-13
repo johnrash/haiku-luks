@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 13:43:34 -0500
-Subject: [PATCH 11/15] luks2: the Linux LUKS partition type; DriveSetup names
+Subject: [PATCH 11/16] luks2: the Linux LUKS partition type; DriveSetup names
  LUKS2 volumes
 
 DriveSetup listed an encrypted partition as "Unknown (Linux data)": its

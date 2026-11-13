@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 02:46:20 -0500
-Subject: [PATCH 06/15] luks2 tests: stop a VM that doesn't power off by itself
+Subject: [PATCH 06/16] luks2 tests: stop a VM that doesn't power off by itself
 
 After the console session, the QEMU tests give the guest a minute to
 power off, then stop it, instead of waiting for the whole timeout (a VM

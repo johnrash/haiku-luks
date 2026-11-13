@@ -57,9 +57,9 @@ Be File System mounted at `/boot`:
 
 - **x86_64, UEFI:** built and tested. Tested in QEMU (OVMF, NVMe disks)
   with scripted boots, GUI tests and RAM searches for leftover keys. On
-  current `master` a QEMU test boot sometimes hangs, or loses its serial
-  console, because of two problems in stock Haiku
-  ([`docs/BUILDING.md`](docs/BUILDING.md), end of section 4).
+  current `master` a QEMU test boot sometimes hangs, because of a deadlock
+  in stock Haiku ([`docs/BUILDING.md`](docs/BUILDING.md), end of
+  section 4).
   Outside the tests it has run on one laptop (an encrypted install booted
   from its NVMe disk) and in one KVM virtual machine, with the same changes
   on an older Haiku base (late October 2026).
@@ -81,7 +81,7 @@ Be File System mounted at `/boot`:
 
 ## The patches
 
-[`patches/`](patches) holds 15 `git format-patch` files for Haiku's
+[`patches/`](patches) holds 16 `git format-patch` files for Haiku's
 `master` branch, made on top of `a8694efb7c` (2026-11-12). Together they
 change 78 files, most of them new.
 
@@ -102,6 +102,7 @@ change 78 files, most of them new.
 | 0013 | Kernel: unmount the volumes it can before shutting down, so FAT volumes are left clean |
 | 0014 | Test fix: the EFI loader is in `/boot/system` on current `master` |
 | 0015 | DriveSetup: lock the window while scanning the disks (stock `master` dropped into the debugger) |
+| 0016 | Test fix: the QEMU tests' serial console is a file, not a socket (on a socket, Haiku's kernel sometimes turned its serial output off) |
 
 Patches 0008, 0010, 0012, 0013 and 0015 fix bugs in stock Haiku that the
 encryption work ran into, outside the LUKS code. An encrypted install

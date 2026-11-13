@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 13 Nov 2026 11:45:10 -0500
+Subject: [PATCH 16/16] luks2 tests: the serial console on a file, not a socket
+
+Since b190b70845, Haiku's x86 kernel gives up on the serial port for the
+rest of the boot the first time put_char() polls the UART 256K times
+without being able to send. A QEMU socket chardev holds only about 280
+one-byte writes, so when a console script read the socket about 50 ms
+late during the kernel's device scan, the kernel turned its serial
+output off: the guest finished its test and powered off, and the test
+saw no result (2 to 3 % of the boots).
+
+QEMU now writes the serial output to a file and reads the keystrokes
+from a FIFO (-chardev file,...,input-path=), which never makes the UART
+wait. The run scripts hold the FIFO open, so that QEMU's open of it
+doesn't wait for a writer; boot_console.py and loader_console.py follow
+the file until QEMU's process has ended. run-ui-test.sh no longer stops
+(set -e) before its summary when the installed boot printed no LUKSTEST
+lines.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tests/system/luks2/README.md              |  6 ++
+ src/tests/system/luks2/qemu/boot_console.py   | 73 ++++++++++++----
+ src/tests/system/luks2/qemu/loader_console.py | 86 ++++++++++++-------
+ src/tests/system/luks2/qemu/run-boot-test.sh  | 16 +++-
+ .../system/luks2/qemu/run-loader-disk-test.sh | 15 +++-
+ src/tests/system/luks2/qemu/run-ui-test.sh    | 18 ++--
+ 6 files changed, 149 insertions(+), 65 deletions(-)
+
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index b81c23b897..f5f806d613 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -44,6 +44,12 @@ Both need an anyboot image built with these changes, OVMF (`/usr/share/OVMF`), t
+ host `luks`, `bfs_shell` from the build directory and cryptsetup. QEMU runs in
+ software emulation (`-cpu max` emulates AES-NI).
+ 
++The tests that type into the guest's serial console (the boot, loader and UI
++tests) have QEMU write the console's output to a file and read the
++keystrokes from a FIFO (`-chardev file,...,input-path=`). Don't put it on a
++socket: if the reader falls about 50 ms behind while the kernel prints,
++Haiku's x86 kernel turns its serial output off for the rest of the boot.
++
+ - `qemu/run-driver-test.sh`: the driver and the tool on NVMe test disks
+   (`qemu/guest-driver-test.sh` runs in Haiku at boot): a volume cryptsetup
+   encrypted, writes onto a cryptsetup volume (checked on the host with
+diff --git a/src/tests/system/luks2/qemu/boot_console.py b/src/tests/system/luks2/qemu/boot_console.py
+index c29d83e6d3..8d86a4993f 100755
+--- a/src/tests/system/luks2/qemu/boot_console.py
++++ b/src/tests/system/luks2/qemu/boot_console.py
+@@ -5,10 +5,16 @@
+ # Drives a QEMU guest's serial console for run-boot-test.sh: types the
+ # passphrase when the boot loader asks for it (optionally a wrong one
+ # first), and when the guest says so, pauses the VM and saves its RAM to a
+-# file through the QEMU monitor. Logs everything it reads.
++# file through the QEMU monitor.
++# QEMU writes the serial output to a file (-chardev file,path=<log>) and
++# reads the keystrokes from a FIFO (input-path=<FIFO>); this script follows
++# the file until the QEMU process <pid> has ended. A file never refuses a
++# write, so the guest's UART never waits: on a socket that the reader
++# drains a moment too late, Haiku's x86 kernel turns its serial output off
++# for the rest of the boot.
+ #
+-# Usage: boot_console.py <serial socket> <monitor socket> <log>
+-#            <passphrase file> [--wrong-first | --menu]
++# Usage: boot_console.py <pid> <serial log> <serial input FIFO>
++#            <monitor socket> <passphrase file> [--wrong-first | --menu]
+ #            [--dump <file> <bytes>] [--timeout <seconds>]
+ # --menu: Esc at the passphrase prompt, then unlock through the boot menu
+ # ("Select boot volume/state", "Unlock encrypted volume ...", the
+@@ -19,8 +25,9 @@ import socket
+ import sys
+ import time
+ 
+-serial_path, monitor_path, log_path, passphrase_path = sys.argv[1:5]
+-options = sys.argv[5:]
++qemu_pid = int(sys.argv[1])
++log_path, input_path, monitor_path, passphrase_path = sys.argv[2:6]
++options = sys.argv[6:]
+ wrong_first = "--wrong-first" in options
+ menu_steps = None
+ if "--menu" in options:
+@@ -55,6 +62,43 @@ def connect(path):
+             time.sleep(0.2)
+ 
+ 
++class SerialFile:
++    """The serial port as QEMU's output file and input FIFO."""
++
++    def __init__(self, log_path, input_path, pid):
++        self.pid = pid
++        deadline = time.time() + 30
++        while not os.path.exists(log_path):
++            if time.time() > deadline or not self.qemu_running():
++                raise OSError("QEMU didn't create %s" % log_path)
++            time.sleep(0.1)
++        self.fd = os.open(log_path, os.O_RDONLY)
++        # the run script holds the FIFO open for reading, so this doesn't
++        # wait for QEMU
++        self.input = os.open(input_path, os.O_WRONLY)
++
++    def qemu_running(self):
++        try:
++            with open("/proc/%d/stat" % self.pid) as f:
++                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
++        except (OSError, IndexError):
++            return False
++
++    def recv(self, wait):
++        """New output, b"" if none came within <wait> s, None once QEMU
++        has ended and everything is read."""
++        data = os.read(self.fd, 65536)
++        if data:
++            return data
++        if not self.qemu_running():
++            return os.read(self.fd, 65536) or None
++        time.sleep(wait)
++        return b""
++
++    def sendall(self, data):
++        os.write(self.input, data)
++
++
+ def monitor(command):
+     s = connect(monitor_path)
+     s.settimeout(120)
+@@ -76,9 +120,7 @@ def type_text(s, text):
+         time.sleep(0.03)
+ 
+ 
+-serial = connect(serial_path)
+-serial.settimeout(1.0)
+-log = open(log_path, "wb")
++serial = SerialFile(log_path, input_path, qemu_pid)
+ seen = b""
+ scan_from = 0
+ prompts = 0
+@@ -87,16 +129,10 @@ dumped = False
+ start = time.time()
+ 
+ while time.time() - start < timeout:
+-    try:
+-        chunk = serial.recv(65536)
+-        if not chunk:
+-            break
+-    except socket.timeout:
+-        chunk = b""
+-    if chunk:
+-        log.write(chunk)
+-        log.flush()
+-        seen += chunk
++    chunk = serial.recv(0.2)
++    if chunk is None:
++        break
++    seen += chunk
+ 
+     if menu_steps:
+         text, send = menu_steps[0]
+@@ -145,6 +181,5 @@ while time.time() - start < timeout:
+         seen = seen[cut:]
+         scan_from = max(0, scan_from - cut)
+ 
+-log.close()
+ print("console: done after %d s, %d passphrase prompt(s)"
+       % (time.time() - start, prompts), flush=True)
+diff --git a/src/tests/system/luks2/qemu/loader_console.py b/src/tests/system/luks2/qemu/loader_console.py
+index 7160de47e7..e4392e75e1 100755
+--- a/src/tests/system/luks2/qemu/loader_console.py
++++ b/src/tests/system/luks2/qemu/loader_console.py
+@@ -2,20 +2,25 @@
+ # Copyright 2026, haiku-odroid-c2 port authors.
+ # Distributed under the terms of the MIT License.
+ #
+-# Drives a QEMU guest's serial console for run-loader-disk-test.sh and logs
+-# everything it reads. With --menu it presses Space until the boot loader's
+-# menu shows, opens "Select boot volume/state" and stops once the list is
+-# drawn; with --until it stops a moment after the text shows up.
++# Drives a QEMU guest's serial console for run-loader-disk-test.sh. With
++# --menu it presses Space until the boot loader's menu shows, opens "Select
++# boot volume/state" and stops once the list is drawn; with --until it
++# stops a moment after the text shows up.
++# QEMU writes the serial output to a file (-chardev file,path=<log>) and
++# reads the keystrokes from a FIFO (input-path=<FIFO>); this script follows
++# the file until it's done or the QEMU process <pid> has ended (see
++# boot_console.py for why it isn't a socket).
+ #
+-# Usage: loader_console.py <serial socket> <log> [--menu] [--until <text>]
+-#            [--timeout <seconds>]
++# Usage: loader_console.py <pid> <serial log> <serial input FIFO> [--menu]
++#            [--until <text>] [--timeout <seconds>]
+ 
+-import socket
++import os
+ import sys
+ import time
+ 
+-serial_path, log_path = sys.argv[1:3]
+-options = sys.argv[3:]
++qemu_pid = int(sys.argv[1])
++log_path, input_path = sys.argv[2:4]
++options = sys.argv[4:]
+ use_menu = "--menu" in options
+ until = None
+ if "--until" in options:
+@@ -25,22 +30,44 @@ if "--timeout" in options:
+     timeout = int(options[options.index("--timeout") + 1])
+ 
+ 
+-def connect(path):
+-    deadline = time.time() + 30
+-    while True:
++class SerialFile:
++    """The serial port as QEMU's output file and input FIFO."""
++
++    def __init__(self, log_path, input_path, pid):
++        self.pid = pid
++        deadline = time.time() + 30
++        while not os.path.exists(log_path):
++            if time.time() > deadline or not self.qemu_running():
++                raise OSError("QEMU didn't create %s" % log_path)
++            time.sleep(0.1)
++        self.fd = os.open(log_path, os.O_RDONLY)
++        # the run script holds the FIFO open for reading, so this doesn't
++        # wait for QEMU
++        self.input = os.open(input_path, os.O_WRONLY)
++
++    def qemu_running(self):
+         try:
+-            s = socket.socket(socket.AF_UNIX)
+-            s.connect(path)
+-            return s
+-        except OSError:
+-            if time.time() > deadline:
+-                raise
+-            time.sleep(0.2)
++            with open("/proc/%d/stat" % self.pid) as f:
++                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
++        except (OSError, IndexError):
++            return False
++
++    def recv(self, wait):
++        """New output, b"" if none came within <wait> s, None once QEMU
++        has ended and everything is read."""
++        data = os.read(self.fd, 65536)
++        if data:
++            return data
++        if not self.qemu_running():
++            return os.read(self.fd, 65536) or None
++        time.sleep(wait)
++        return b""
+ 
++    def sendall(self, data):
++        os.write(self.input, data)
+ 
+-serial = connect(serial_path)
+-serial.settimeout(0.05)
+-log = open(log_path, "wb")
++
++serial = SerialFile(log_path, input_path, qemu_pid)
+ seen = b""
+ state = "space" if use_menu else "watch"
+ start = time.time()
+@@ -48,16 +75,10 @@ last_space = 0
+ done_at = None
+ 
+ while time.time() - start < timeout:
+-    try:
+-        chunk = serial.recv(65536)
+-        if not chunk:
+-            break
+-    except socket.timeout:
+-        chunk = b""
+-    if chunk:
+-        log.write(chunk)
+-        log.flush()
+-        seen += chunk
++    chunk = serial.recv(0.05)
++    if chunk is None:
++        break
++    seen += chunk
+ 
+     now = time.time()
+     if state == "space":
+@@ -83,5 +104,4 @@ while time.time() - start < timeout:
+         done_at = now + 2
+         state = "wait"
+ 
+-log.close()
+ print("console: done after %d s" % (time.time() - start), flush=True)
+diff --git a/src/tests/system/luks2/qemu/run-boot-test.sh b/src/tests/system/luks2/qemu/run-boot-test.sh
+index 0de2b890a0..0555649d87 100755
+--- a/src/tests/system/luks2/qemu/run-boot-test.sh
++++ b/src/tests/system/luks2/qemu/run-boot-test.sh
+@@ -109,11 +109,16 @@ stop_vm() {
+ 
+ boot() {
+ 	# boot <name> <cpu> <console options...>
++	# The serial port's output goes to a file, its input comes from a FIFO
++	# (see boot_console.py); fd 3 holds the FIFO open, so that QEMU's open
++	# of it doesn't wait for a writer.
+ 	name=$1
+ 	cpu=$2
+ 	shift 2
+ 	cp /usr/share/OVMF/OVMF_VARS_4M.fd vars-$name.fd
+-	rm -f serial-$name.sock monitor-$name.sock
++	rm -f serial-$name.log serial-$name.in monitor-$name.sock
++	mkfifo serial-$name.in
++	exec 3<>serial-$name.in
+ 	start=$(date +%s)
+ 	timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu "$cpu" -smp 4 -m 2048 \
+ 		-accel tcg,thread=multi \
+@@ -122,14 +127,17 @@ boot() {
+ 		-drive if=none,id=disk,file=disk.img,format=raw \
+ 		-device nvme,drive=disk,serial=encrypted \
+ 		-nic none -display none -no-reboot \
+-		-chardev socket,id=ser0,path=serial-$name.sock,server=on,wait=on \
++		-chardev file,id=ser0,path=serial-$name.log,input-path=serial-$name.in \
+ 		-serial chardev:ser0 \
+ 		-monitor unix:monitor-$name.sock,server,nowait \
+ 		> qemu-$name.log 2>&1 &
+ 	qemu=$!
+-	python3 -I "$HERE/boot_console.py" serial-$name.sock monitor-$name.sock \
+-		serial-$name.log "$KEYFILE" "$@" --timeout "$TIMEOUT" || true
++	python3 -I "$HERE/boot_console.py" $qemu serial-$name.log \
++		serial-$name.in monitor-$name.sock "$KEYFILE" "$@" \
++		--timeout "$TIMEOUT" || true
+ 	stop_vm $qemu
++	exec 3<&-
++	rm -f serial-$name.in
+ 	echo "boot $name took $(( $(date +%s) - start )) s"
+ 	grep -a "LUKSTEST" serial-$name.log | sed 's/^.*LUKSTEST /guest: /'
+ 	grep -a -E "luks: |vfs_boot: |PANIC|panic\(" serial-$name.log | head -20
+diff --git a/src/tests/system/luks2/qemu/run-loader-disk-test.sh b/src/tests/system/luks2/qemu/run-loader-disk-test.sh
+index 9c15c43eb8..e232042429 100755
+--- a/src/tests/system/luks2/qemu/run-loader-disk-test.sh
++++ b/src/tests/system/luks2/qemu/run-loader-disk-test.sh
+@@ -85,12 +85,17 @@ mcopy -i esp.img@@1M "$LOADER" ::/EFI/BOOT/BOOTX64.EFI
+ # boot <name> <extra QEMU options> <console options...>
+ # The internal disk is connected first (bootindex 0, nothing to boot on it)
+ # so that the firmware lists it first; the stick follows.
++# The serial port's output goes to a file, its input comes from a FIFO (see
++# boot_console.py); fd 3 holds the FIFO open, so that QEMU's open of it
++# doesn't wait for a writer.
+ boot() {
+ 	name=$1
+ 	extra=$2
+ 	shift 2
+ 	cp /usr/share/OVMF/OVMF_VARS_4M.fd vars-$name.fd
+-	rm -f serial-$name.sock
++	rm -f serial-$name.log serial-$name.in
++	mkfifo serial-$name.in
++	exec 3<>serial-$name.in
+ 	timeout 900 qemu-system-x86_64 -M q35 -cpu max -smp 2 -m 2048 \
+ 		-accel tcg,thread=multi \
+ 		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+@@ -102,14 +107,16 @@ boot() {
+ 		-drive if=none,id=stick,file=stick.img,format=raw,snapshot=on \
+ 		-device usb-storage,bus=xhci.0,drive=stick,bootindex=2 \
+ 		-nic none -display none -no-reboot \
+-		-chardev socket,id=ser0,path=serial-$name.sock,server=on,wait=on \
++		-chardev file,id=ser0,path=serial-$name.log,input-path=serial-$name.in \
+ 		-serial chardev:ser0 \
+ 		> qemu-$name.log 2>&1 &
+ 	qemu=$!
+-	python3 -I "$HERE/loader_console.py" serial-$name.sock serial-$name.log \
+-		"$@" || true
++	python3 -I "$HERE/loader_console.py" $qemu serial-$name.log \
++		serial-$name.in "$@" || true
+ 	kill $qemu 2>/dev/null || true
+ 	wait $qemu 2>/dev/null || true
++	exec 3<&-
++	rm -f serial-$name.in
+ 	# the console as lines, without escape sequences
+ 	sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' serial-$name.log | tr '\r' '\n' \
+ 		> text-$name.log
+diff --git a/src/tests/system/luks2/qemu/run-ui-test.sh b/src/tests/system/luks2/qemu/run-ui-test.sh
+index 17d51069c9..e42ba594b5 100755
+--- a/src/tests/system/luks2/qemu/run-ui-test.sh
++++ b/src/tests/system/luks2/qemu/run-ui-test.sh
+@@ -169,8 +169,13 @@ else
+ fi
+ 
+ echo "== booting the installed encrypted disk on its own"
++# The serial port's output goes to a file, its input comes from a FIFO (see
++# boot_console.py); fd 3 holds the FIFO open, so that QEMU's open of it
++# doesn't wait for a writer.
+ cp /usr/share/OVMF/OVMF_VARS_4M.fd vars2.fd
+-rm -f s2.sock m2.sock
++rm -f serial-installed.log serial-installed.in m2.sock
++mkfifo serial-installed.in
++exec 3<>serial-installed.in
+ timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 2048 \
+ 	-accel tcg,thread=multi \
+ 	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+@@ -178,15 +183,18 @@ timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 2048 \
+ 	-drive if=none,id=disk,file=target.img,format=raw \
+ 	-device nvme,drive=disk,serial=installed \
+ 	-nic none -display none -no-reboot \
+-	-chardev socket,id=ser0,path=s2.sock,server=on,wait=on \
++	-chardev file,id=ser0,path=serial-installed.log,input-path=serial-installed.in \
+ 	-serial chardev:ser0 -monitor unix:m2.sock,server,nowait \
+ 	> qemu-installed.log 2>&1 &
+ qemu=$!
+-python3 -I "$HERE/boot_console.py" s2.sock m2.sock serial-installed.log \
+-	files/key-installed --timeout "$TIMEOUT" || true
++python3 -I "$HERE/boot_console.py" $qemu serial-installed.log \
++	serial-installed.in m2.sock files/key-installed --timeout "$TIMEOUT" \
++	|| true
+ stop_vm $qemu
++exec 3<&-
++rm -f serial-installed.in
+ grep -a "LUKSTEST" serial-installed.log | sed 's/^.*LUKSTEST /installed: /' \
+-	| grep -v "installed:    |"
++	| grep -v "installed:    |" || true
+ if grep -aq "LUKSTEST done: [0-9]* passed, 0 failed" serial-installed.log; then
+ 	ok "the installed encrypted system booted with one passphrase prompt"
+ else

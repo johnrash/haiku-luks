@@ -3,11 +3,11 @@
 The patches in [`../patches`](../patches) are `git format-patch` files for
 Haiku's `master` branch. They were made on top of commit
 `a8694efb7c64c84072a83d405531bed559680bb8` ("PCI: Cleanup ReadConfig and
-WriteConfig methods.", 2026-11-12). That tree, with all 15 patches, builds
+WriteConfig methods.", 2026-11-12). That tree, with all 16 patches, builds
 an x86_64 image with no compiler warnings in the files they change. Its
 results in the tests below are in [`DESIGN.md`](DESIGN.md) ("Tested"). The
-QEMU tests also run into two problems of stock Haiku: a deadlock, and a
-serial console that goes quiet (end of section 4).
+QEMU tests also run into a deadlock of stock Haiku now and then (end of
+section 4).
 
 You need a Linux (or other) machine that can build Haiku: see Haiku's
 ["Building Haiku"](https://www.haiku-os.org/guides/building/) guides for
@@ -147,18 +147,17 @@ these patches:
 
 It hit 8 of 125 boots here. If a boot hangs, run the test again.
 
-**Serial output that stops.** In 4 of those 125 boots the serial log ended
-early, about 13 s into the boot (during the kernel's device scan), and the
-test reported no result. The guest itself finished the test and powered off
-as usual.
-
-Since early 2025 (commit b190b70845), Haiku's x86 kernel turns its serial
-debug output off for the rest of the boot the first time the UART stays
-busy for 256K polls. Under QEMU that happens when whatever reads a
-socket-backed serial port falls behind by about 50 ms. The patches don't
-cause it, and the guest is fine. Run the test again, or attach the serial
-port to a file (`-chardev file,...,input-path=<fifo>`), which never makes
-the UART wait.
+**Serial output that stops.** Since early 2025 (commit b190b70845),
+Haiku's x86 kernel turns its serial debug output off for the rest of the
+boot the first time the UART stays busy for 256K polls. Under QEMU that
+happens when whatever reads a socket-backed serial port falls behind by
+about 50 ms. The tests used to read the serial port through a socket, and
+in 4 of those 125 boots the serial log ended about 13 s into the boot
+(during the kernel's device scan): the guest finished its test and powered
+off as usual, but the test saw no result. Since patch 0016, QEMU writes
+the serial output to a file and reads the keystrokes from a FIFO
+(`-chardev file,...,input-path=<fifo>`), which never makes the UART wait.
+Keep it that way if you change the scripts or run QEMU yourself.
 
 `sh $T/arm64_compile_check.sh generated.arm64 /tmp/luks-arm64` compiles
 every LUKS2 source and the changed loader files for arm64 with `-Werror`.

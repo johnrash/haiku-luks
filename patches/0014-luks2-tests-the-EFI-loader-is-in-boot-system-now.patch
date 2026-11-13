@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Fri, 13 Nov 2026 07:56:09 -0500
-Subject: [PATCH 14/15] luks2 tests: the EFI loader is in /boot/system now
+Subject: [PATCH 14/16] luks2 tests: the EFI loader is in /boot/system now
 
 Since "Move bootloaders around somewhat." (d1231c1ac9), the haiku
 package puts the EFI loader at /boot/system/haiku_loader.efi, where

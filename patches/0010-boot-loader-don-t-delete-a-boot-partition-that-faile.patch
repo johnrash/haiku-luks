@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 12:56:02 -0500
-Subject: [PATCH 10/15] boot loader: don't delete a boot partition that failed
+Subject: [PATCH 10/16] boot loader: don't delete a boot partition that failed
  to mount
 
 On a laptop, an encrypted system installed into a GPT partition

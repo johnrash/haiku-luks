@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 11:41:58 -0500
-Subject: [PATCH 09/15] luks2 tests: loader_console.py reads the rest of the
+Subject: [PATCH 09/16] luks2 tests: loader_console.py reads the rest of the
  line it waited for
 
 With --until it stopped reading as soon as the text showed up, so the
