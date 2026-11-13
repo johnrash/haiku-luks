@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 02:44:41 -0500
-Subject: [PATCH 05/16] luks2: fixes from a review: layout and limit checks,
+Subject: [PATCH 05/17] luks2: fixes from a review: layout and limit checks,
  wiping, boot identity
 
 A second agent reviewed the code against the specification and fuzzed it

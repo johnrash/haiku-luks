@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 11:39:52 -0500
-Subject: [PATCH 08/16] efi loader: boot the disk the loader came from; grow
+Subject: [PATCH 08/17] efi loader: boot the disk the loader came from; grow
  the heap
 
 Started from a USB stick on a laptop whose NVMe disk holds

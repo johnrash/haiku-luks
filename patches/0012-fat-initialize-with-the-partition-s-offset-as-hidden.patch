@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Thu, 12 Nov 2026 00:29:28 -0500
-Subject: [PATCH 12/16] fat: initialize with the partition's offset as hidden
+Subject: [PATCH 12/17] fat: initialize with the partition's offset as hidden
  sectors
 
 The BPB's hidden sectors field counts the sectors before the volume on

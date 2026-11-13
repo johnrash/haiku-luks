@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 07:31:12 -0500
-Subject: [PATCH 07/16] luks2: fixes from a correctness review: transactions,
+Subject: [PATCH 07/17] luks2: fixes from a correctness review: transactions,
  durability, in-use checks
 
 - Header writes are ordered and flushed: luks2_device_io has a flush hook

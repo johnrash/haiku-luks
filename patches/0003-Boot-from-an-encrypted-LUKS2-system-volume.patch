@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 01:28:18 -0500
-Subject: [PATCH 03/16] Boot from an encrypted (LUKS2) system volume
+Subject: [PATCH 03/17] Boot from an encrypted (LUKS2) system volume
 
 The boot loader (src/system/boot/loader/luks.cpp, enabled for the EFI
 loaders of all architectures, BOOT_SUPPORT_LUKS):

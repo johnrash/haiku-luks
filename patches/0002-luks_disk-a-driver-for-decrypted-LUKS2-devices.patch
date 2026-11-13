@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 00:38:41 -0500
-Subject: [PATCH 02/16] luks_disk: a driver for decrypted LUKS2 devices
+Subject: [PATCH 02/17] luks_disk: a driver for decrypted LUKS2 devices
 
 drivers/disk/virtual/luks_disk publishes each LUKS2 volume opened with
 its volume key as /dev/disk/virtual/luks/<id>/raw, which the disk device

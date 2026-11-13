@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Wed, 11 Nov 2026 02:44:41 -0500
-Subject: [PATCH 04/16] Encrypted volumes from Haiku: EncryptedVolume, Tracker,
+Subject: [PATCH 04/17] Encrypted volumes from Haiku: EncryptedVolume, Tracker,
  DriveSetup
 
 EncryptedVolume (src/apps/encryptedvolume, in system/apps):

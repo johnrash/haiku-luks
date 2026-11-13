@@ -495,15 +495,9 @@ A simpler single-thread partial-write hypothesis did not reproduce: Haiku
 permits the writer thread to acquire the read lock recursively. The confirmed
 deadlock above requires exhausting the shared resources during page faults.
 
-Patch 0017 validation: the driver and CLI cross-compiled and linked for
-x86_64; the native memory-test helper compiled with `-Werror`. The optimized
-host interoperability/crash suite passed 69 of 69 checks. The eight new
-command-safety checks passed both optimized and ASan/UBSan builds. The
-sanitizer run used `ASAN_OPTIONS=detect_leaks=0` because LeakSanitizer could
-not run in this traced environment; leak checking is not covered by that
-run. The unchanged crypto vectors and 226 randomized comparisons also
-passed in both builds. The full boot, Installer and arm64 suites were not
-rerun for this patch.
+The review tested its fixes in an image of patches 0001-0016 with the
+rebuilt `haiku` package; an image built with all 17 patches then passed
+the whole suite ("Tested").
 
 ## Tested
 
@@ -532,6 +526,17 @@ late October 2026). On `master` a8694efb7c (2026-11-12), on 2026-11-13:
   lines, where the deadlock hangs; that hang wasn't captured to confirm
   it. The same disk then booted 4 more times and passed its checks each
   time.
+- **All 17 patches,** an image built with them all:
+  - the host tests, optimised and with ASan/UBSan, LeakSanitizer on:
+    the vectors, 229 and 225 random comparisons, the 8 command-safety
+    checks, 69 of 69 cryptsetup checks and the 368 crash states, no
+    failures;
+  - the driver test, 43 checks in Haiku and 6 on the host;
+  - the memory test, 16 of 16 concurrent reads into cold file mappings;
+  - the loader test, 8 of 8, and the boot test, 19 of 19;
+  - the UI test: 25 checks in the live system, 4 on the host, and 5 in
+    the installed system, which booted on its own;
+  - `arm64_compile_check.sh`, 36 of 36.
 
 | What | How | Result |
 |---|---|---|

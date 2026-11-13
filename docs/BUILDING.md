@@ -3,10 +3,8 @@
 The patches in [`../patches`](../patches) are `git format-patch` files for
 Haiku's `master` branch. They were made on top of commit
 `a8694efb7c64c84072a83d405531bed559680bb8` ("PCI: Cleanup ReadConfig and
-WriteConfig methods.", 2026-11-12). Patches 0001–0016 built
-an x86_64 image with no compiler warnings in the files they change. Patch
-0017's driver, command and regression helper were cross-compiled and
-tested in that image with the updated package. Its
+WriteConfig methods.", 2026-11-12). That tree, with all 17 patches, builds
+an x86_64 image with no compiler warnings in the files they change. Its
 results in the tests below are in [`DESIGN.md`](DESIGN.md) ("Tested"). The
 QEMU tests also run into a deadlock of stock Haiku now and then (end of
 section 4).

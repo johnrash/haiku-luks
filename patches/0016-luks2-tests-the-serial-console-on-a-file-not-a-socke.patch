@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: jrash <johnrash@gmail.com>
 Date: Fri, 13 Nov 2026 11:45:10 -0500
-Subject: [PATCH 16/16] luks2 tests: the serial console on a file, not a socket
+Subject: [PATCH 16/17] luks2 tests: the serial console on a file, not a socket
 
 Since b190b70845, Haiku's x86 kernel gives up on the serial port for the
 rest of the boot the first time put_char() polls the UART 256K times
