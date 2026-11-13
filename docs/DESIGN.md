@@ -488,13 +488,14 @@ patches, on 2026-11-13:
 - **Same results:** the host tests (both builds), the driver test and the
   loader test.
 - **The boot test:** each of its checks passed in at least one of three
-  runs. The boots that failed hit one of the two problems described at the
-  end of `BUILDING.md`, section 4:
-  - a deadlock in stock Haiku, between net_server and launch_daemon;
-  - a VM that stops by itself, not explained yet.
+  runs. The boots that failed hit one of the two problems of stock Haiku
+  described at the end of `BUILDING.md`, section 4:
+  - a deadlock between net_server and launch_daemon;
+  - the kernel switching its serial output off when the UART stays busy
+    too long. The guest carries on, but the test can't see its result.
 - **The UI test:** the live system's 25 checks and the host's checks
-  passed. The installed disk's boot passed once, and in a second run it hit
-  the VM stop.
+  passed. The installed disk's boot passed once. In a second run its
+  serial output went quiet the same way.
 
 | What | How | Result |
 |---|---|---|

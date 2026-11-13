@@ -6,8 +6,8 @@ Haiku's `master` branch. They were made on top of commit
 WriteConfig methods.", 2026-11-12). That tree, with all 15 patches, builds
 an x86_64 image with no compiler warnings in the files they change. Its
 results in the tests below are in [`DESIGN.md`](DESIGN.md) ("Tested"). The
-QEMU tests also run into a deadlock in stock Haiku, and a rare VM stop that
-isn't explained yet (end of section 4).
+QEMU tests also run into two problems of stock Haiku: a deadlock, and a
+serial console that goes quiet (end of section 4).
 
 You need a Linux (or other) machine that can build Haiku: see Haiku's
 ["Building Haiku"](https://www.haiku-os.org/guides/building/) guides for
@@ -147,15 +147,18 @@ these patches:
 
 It hit 8 of 125 boots here. If a boot hangs, run the test again.
 
-**A rarer stop.** In 4 of those 125 boots the VM stopped by itself, with no
-panic message:
-- three times while the kernel probed QEMU's empty CD drive (AHCI) during
-  its device scan;
-- once after the guest test had started.
+**Serial output that stops.** In 4 of those 125 boots the serial log ended
+early, about 13 s into the boot (during the kernel's device scan), and the
+test reported no result. The guest itself finished the test and powered off
+as usual.
 
-It isn't explained yet. The boot loader is the only patched code that runs
-before that point, so it can't be ruled out yet. If a boot stops, run the
-test again.
+Since early 2025 (commit b190b70845), Haiku's x86 kernel turns its serial
+debug output off for the rest of the boot the first time the UART stays
+busy for 256K polls. Under QEMU that happens when whatever reads a
+socket-backed serial port falls behind by about 50 ms. The patches don't
+cause it, and the guest is fine. Run the test again, or attach the serial
+port to a file (`-chardev file,...,input-path=<fifo>`), which never makes
+the UART wait.
 
 `sh $T/arm64_compile_check.sh generated.arm64 /tmp/luks-arm64` compiles
 every LUKS2 source and the changed loader files for arm64 with `-Werror`.

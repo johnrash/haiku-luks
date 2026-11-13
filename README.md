@@ -40,9 +40,9 @@ RFCs. It's all MIT-licensed.
 
 - **x86_64, UEFI:** built and tested. Tested in QEMU (OVMF, NVMe disks)
   with scripted boots, GUI tests and RAM searches for leftover keys. On
-  current `master` the QEMU tests sometimes hang or stop for reasons
-  outside the LUKS code ([`docs/BUILDING.md`](docs/BUILDING.md), end of
-  section 4).
+  current `master` a QEMU test boot sometimes hangs, or loses its serial
+  console, because of two problems in stock Haiku
+  ([`docs/BUILDING.md`](docs/BUILDING.md), end of section 4).
   Outside the tests it has run on one laptop (an encrypted install booted
   from its NVMe disk) and in one KVM virtual machine, with the same changes
   on an older Haiku base (late October 2026).
