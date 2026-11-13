@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 13 Nov 2026 07:56:09 -0500
+Subject: [PATCH 14/15] luks2 tests: the EFI loader is in /boot/system now
+
+Since "Move bootloaders around somewhat." (d1231c1ac9), the haiku
+package puts the EFI loader at /boot/system/haiku_loader.efi, where
+Installer's "Install EFI loader" takes it from, instead of in
+data/platform_loaders. guest-ui-test.sh compares the loader on the ESP
+with that file.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tests/system/luks2/qemu/guest-ui-test.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/tests/system/luks2/qemu/guest-ui-test.sh b/src/tests/system/luks2/qemu/guest-ui-test.sh
+index 58eae9ceb4..9803968ebb 100755
+--- a/src/tests/system/luks2/qemu/guest-ui-test.sh
++++ b/src/tests/system/luks2/qemu/guest-ui-test.sh
+@@ -201,7 +201,7 @@ sleep 4
+ screenshot -s -f png /boot/home/ui-efi.png
+ hey Installer ALTB of Window 0 with which="int32(0)" > /dev/null
+ ok "Install EFI loader invoked (the host checks the ESP)"
+-md5sum /boot/system/data/platform_loaders/haiku_loader.efi | cut -d' ' -f1 \
++md5sum /boot/system/haiku_loader.efi | cut -d' ' -f1 \
+ 	> /tmp/loader.md5
+ 
+ # the installed system runs the boot checks and lets us in at its first boot

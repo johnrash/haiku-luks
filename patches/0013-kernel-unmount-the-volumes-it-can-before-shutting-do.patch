@@ -1,0 +1,149 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 12 Nov 2026 01:55:26 -0500
+Subject: [PATCH 13/15] kernel: unmount the volumes it can before shutting down
+
+Shutdown only synced, so a volume mounted at the time was never unmounted.
+FAT records a clean state only at unmount: an EFI system partition or a
+USB stick mounted at shutdown stayed marked "not cleanly unmounted"
+(FAT[1] 0x7fff on a VM install's ESP), which Windows takes for a
+crash and mtools refuses.
+
+system_shutdown() now unmounts, newest first, the writable volumes on a
+/dev device other than the boot volume. Network and virtual file systems
+are left alone. Nothing is forced (fs_unmount() can wait forever then): a
+volume still in use stays mounted and is synced as before. When
+rebooting, the teams were just killed and release their files as they
+die, so a busy volume is tried again for up to 2 s. Each volume is
+logged as unmounted or staying mounted.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/kernel/shutdown.cpp | 97 ++++++++++++++++++++++++++++++++--
+ 1 file changed, 94 insertions(+), 3 deletions(-)
+
+diff --git a/src/system/kernel/shutdown.cpp b/src/system/kernel/shutdown.cpp
+index 7759b677de..4bff14a2aa 100644
+--- a/src/system/kernel/shutdown.cpp
++++ b/src/system/kernel/shutdown.cpp
+@@ -5,8 +5,98 @@
+  */
+ 
+ 
++#include <stdlib.h>
++#include <string.h>
++
++#include <fs_info.h>
++
++#include <boot_device.h>
+ #include <kernel.h>
+ #include <syscalls.h>
++#include <vfs.h>
++
++
++/*!	Whether the volume is one to unmount before the power goes: writable, on
++	a device, and not the boot volume. Network and virtual file systems
++	(packagefs, ramfs, ...) are left alone: they have nothing to mark clean,
++	and a network one could wait for a server that's gone.
++*/
++static bool
++unmount_at_shutdown(dev_t device, fs_info& info)
++{
++	return device != gBootDevice
++		&& _kern_read_fs_info(device, &info) == B_OK
++		&& strncmp(info.device_name, "/dev/", 5) == 0
++		&& (info.flags & B_FS_IS_READONLY) == 0;
++}
++
++
++/*!	Unmounts the volumes it can, newest first. Some file systems record a
++	clean state only at unmount: FAT clears its "not cleanly unmounted" bit
++	then, so a FAT volume (an EFI system partition, a USB stick) that was
++	mounted at shutdown stayed marked dirty, and other systems took that for
++	a crash (Windows offers to check the disk, mtools refuses it).
++	A volume still in use stays mounted, as before; sync() writes its data.
++	Forcing the unmount isn't safe here (fs_unmount() can wait forever for
++	a vnode). When rebooting, the teams were just killed, and they release
++	their files as they go, so a busy volume is tried again for a while.
++*/
++static void
++unmount_volumes(bool teamsKilled)
++{
++	// Device IDs are given out in mount order: unmount the newest first, so
++	// that a volume goes before the one it may be stacked on.
++	int32 count = 0;
++	int32 cookie = 0;
++	while (_kern_next_device(&cookie) >= 0)
++		count++;
++
++	dev_t* devices = (dev_t*)malloc(sizeof(dev_t) * (count + 1));
++	if (devices == NULL)
++		return;
++
++	int32 found = 0;
++	cookie = 0;
++	dev_t device;
++	while (found < count && (device = _kern_next_device(&cookie)) >= 0)
++		devices[found++] = device;
++
++	bigtime_t deadline = system_time() + (teamsKilled ? 2000000 : 0);
++	int32 busy;
++	do {
++		busy = 0;
++		for (int32 i = found; i-- > 0;) {
++			if (devices[i] < 0)
++				continue;
++
++			fs_info info;
++			if (!unmount_at_shutdown(devices[i], info)) {
++				devices[i] = -1;
++				continue;
++			}
++
++			status_t status = vfs_unmount(devices[i], 0);
++			if (status == B_BUSY && system_time() < deadline) {
++				busy++;
++				continue;
++			}
++
++			if (status == B_OK) {
++				dprintf("shutdown: unmounted \"%s\" (%s)\n", info.volume_name,
++					info.device_name);
++			} else {
++				dprintf("shutdown: \"%s\" (%s) stays mounted: %s\n",
++					info.volume_name, info.device_name, strerror(status));
++			}
++			devices[i] = -1;
++		}
++
++		if (busy > 0)
++			snooze(100000);
++	} while (busy > 0);
++
++	free(devices);
++}
+ 
+ 
+ status_t
+@@ -14,9 +104,9 @@ system_shutdown(bool reboot)
+ {
+ 	int32 cookie = 0;
+ 	team_info info;
+-	
++
+ 	gKernelShutdown = true;
+-	
++
+ 	// Now shutdown all system services!
+ 	// TODO: Once we are sure we can shutdown the system on all hardware
+ 	// checking reboot may not be necessary anymore.
+@@ -27,7 +117,8 @@ system_shutdown(bool reboot)
+ 			kill_team(info.team);
+ 		}
+ 	}
+-	
++
++	unmount_volumes(reboot);
+ 	sync();
+ 
+ 	return arch_cpu_shutdown(reboot);

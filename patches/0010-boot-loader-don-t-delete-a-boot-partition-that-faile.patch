@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 12:56:02 -0500
+Subject: [PATCH 10/15] boot loader: don't delete a boot partition that failed
+ to mount
+
+On a laptop, an encrypted system installed into a GPT partition
+typed as BFS (DriveSetup's choice for a new partition) never got to the
+passphrase prompt: the EFI loader crashed (page fault) right after "no
+boot path found".
+
+get_boot_file_system() tries to mount each BFS-typed partition on a
+boot device, and deleted one that failed. But platform_get_boot_partitions()
+had put that partition into bootPartitions with the node's only list
+link while gPartitions still pointed to it, so gPartitions was left
+pointing to freed memory, and mount_file_systems() crashed walking it.
+The partition is now kept: mount_file_systems() then finds the LUKS2
+volume in it.
+
+run-boot-test.sh: boot 7 changes the partition's type to BFS and must
+reach the passphrase prompt.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/boot/loader/vfs.cpp               | 12 ++++++++----
+ src/tests/system/luks2/qemu/run-boot-test.sh | 13 +++++++++++++
+ 2 files changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/src/system/boot/loader/vfs.cpp b/src/system/boot/loader/vfs.cpp
+index c188d4f418..90e5988aea 100644
+--- a/src/system/boot/loader/vfs.cpp
++++ b/src/system/boot/loader/vfs.cpp
+@@ -734,10 +734,14 @@ get_boot_file_system(stage2_args* args, BootVolume& _bootVolume)
+ 			Directory *fileSystem;
+ 			error = partition->Mount(&fileSystem, true);
+ 			if (error != B_OK) {
+-				// this partition doesn't contain any known file system; we
+-				// don't need it anymore
+-				gPartitions.Remove(partition);
+-				delete partition;
++				// No file system the loader knows, but keep the partition:
++				// it can be an encrypted volume (in a partition typed as
++				// BFS) that mount_file_systems() finds later. And it can't
++				// be removed safely: a node has a single list link, which
++				// bootPartitions took over while gPartitions still points to
++				// the node, so removing it from gPartitions breaks that list
++				// and deleting it left gPartitions pointing to freed memory
++				// (the loader crashed in mount_file_systems()).
+ 				continue;
+ 			}
+ 
+diff --git a/src/tests/system/luks2/qemu/run-boot-test.sh b/src/tests/system/luks2/qemu/run-boot-test.sh
+index e810d7dfac..0de2b890a0 100755
+--- a/src/tests/system/luks2/qemu/run-boot-test.sh
++++ b/src/tests/system/luks2/qemu/run-boot-test.sh
+@@ -23,6 +23,8 @@
+ #  - boot 6: the primary's magic damaged too: the loader must find the
+ #    volume by its secondary header.
+ # Then the build host decrypts the volume and checks what Haiku wrote.
++#  - boot 7: the partition's GPT type changed to BFS (DriveSetup offers it
++#    for a new partition): the loader must still ask for the passphrase.
+ #
+ # Usage: run-boot-test.sh <anyboot image> <haiku_loader.efi> <work dir>
+ #            <host luks> <bfs_shell> <cryptsetup> [timeout seconds]
+@@ -257,5 +259,16 @@ fi
+ [ "$(cat marker-back)" = "written at boot 6" ] && ok "marker of boot 6" \
+ 	|| bad "marker: $(cat marker-back)"
+ 
++echo "== boot 7: the encrypted partition typed as BFS, as DriveSetup offers"
++# The loader tries to mount a BFS-typed partition on its disk as the boot
++# volume; when that failed, it deleted the partition while a list still
++# pointed to it, and crashed in the scan that looks for encrypted volumes.
++sgdisk -t 2:eb00 disk.img > /dev/null
++boot seventh max
++grep -a -q "luks: locked LUKS2 volume" serial-seventh.log \
++	&& ! grep -a -q "Exception Type" serial-seventh.log \
++	&& ok "the loader found the volume in a BFS-typed partition" \
++	|| bad "the loader didn't find the volume in a BFS-typed partition"
++
+ echo "$passed passed, $failed failed"
+ [ $failed -eq 0 ]

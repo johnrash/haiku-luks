@@ -1,0 +1,2702 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 02:44:41 -0500
+Subject: [PATCH 04/15] Encrypted volumes from Haiku: EncryptedVolume, Tracker,
+ DriveSetup
+
+EncryptedVolume (src/apps/encryptedvolume, in system/apps):
+- "EncryptedVolume <partition>" asks for the passphrase (read-only
+  option), unlocks it in a worker thread, mounts what's inside and opens
+  it in Tracker; a wrong passphrase is said in the window;
+- "--encrypt <partition>" asks for a name and the passphrase twice,
+  formats LUKS2 (Argon2id measured for 2 s), puts BFS on it through the
+  disk device manager and mounts it;
+- "--lock <partition>" unmounts and locks.
+Its windows answer 'unlk' and 'encr' scripting messages for tests.
+
+Tracker's Mount menu lists locked LUKS2 partitions as "Unlock ...", which
+starts EncryptedVolume. DriveSetup's Partition menu has Unlock..., Lock
+(not for the boot volume) and Encrypt... . Both recognise LUKS2 by its
+signature (luks2_partitions.cpp, no crypto), as DriveSetup did for its
+lock icon: a disk-system add-on would make mount_server and DriveSetup
+try to mount the container.
+
+luks_disk: the decrypted device is removable and B_EJECT_DEVICE locks
+it, so mount_server mounts the volume when it's unlocked and locks it
+after Tracker unmounted it, with no change to either. The volume is
+opened without the driver's lock held (open() and close() of a device
+take the device manager's lock, which init/uninit_driver hold when they
+take ours: a deadlock a review found).
+
+luks2_userland.cpp: random numbers and the KDF choice, shared by the luks
+command and EncryptedVolume.
+
+Installer needed no change: an unlocked volume is a valid target and its
+"Install EFI loader" puts the loader on the ESP.
+
+Tested in QEMU, src/tests/system/luks2/qemu/run-ui-test.sh (driven over
+ssh with hey): encrypt, unmount (locks), unlock through Tracker with a
+wrong and the right passphrase, lock, encrypt a GPT partition, install
+onto it with Installer, install the EFI loader, then boot that disk on
+its own with one passphrase prompt: 14 + 3 + 5 checks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/images/definitions/minimum          |   1 +
+ headers/private/luks2/luks2_userland.h        |  76 ++
+ .../disk/virtual/luks_disk/luks_disk.cpp      |  40 +-
+ src/apps/Jamfile                              |   1 +
+ src/apps/drivesetup/Jamfile                   |   6 +
+ src/apps/drivesetup/MainWindow.cpp            |  81 ++
+ src/apps/drivesetup/MainWindow.h              |   5 +
+ src/apps/encryptedvolume/EncryptedVolume.cpp  | 887 ++++++++++++++++++
+ src/apps/encryptedvolume/EncryptedVolume.rdef |  29 +
+ src/apps/encryptedvolume/Jamfile              |  41 +
+ src/bin/luks/Jamfile                          |   2 +
+ src/bin/luks/luks.cpp                         | 191 +---
+ src/kits/tracker/Commands.h                   |   1 +
+ src/kits/tracker/Jamfile                      |   6 +
+ src/kits/tracker/MountMenu.cpp                |  45 +-
+ src/kits/tracker/Tracker.cpp                  |  12 +
+ src/libs/luks2/luks2_partitions.cpp           | 171 ++++
+ src/libs/luks2/luks2_userland.cpp             | 167 ++++
+ src/tests/system/luks2/README.md              |  12 +
+ src/tests/system/luks2/arm64_compile_check.sh |   6 +-
+ src/tests/system/luks2/build_host.sh          |   2 +-
+ .../system/luks2/qemu/guest-driver-test.sh    |  39 +-
+ src/tests/system/luks2/qemu/guest-ui-test.sh  | 163 ++++
+ src/tests/system/luks2/qemu/locale-settings   | Bin 0 -> 394 bytes
+ src/tests/system/luks2/qemu/run-ui-test.sh    | 177 ++++
+ 25 files changed, 1973 insertions(+), 188 deletions(-)
+ create mode 100644 headers/private/luks2/luks2_userland.h
+ create mode 100644 src/apps/encryptedvolume/EncryptedVolume.cpp
+ create mode 100644 src/apps/encryptedvolume/EncryptedVolume.rdef
+ create mode 100644 src/apps/encryptedvolume/Jamfile
+ create mode 100644 src/libs/luks2/luks2_partitions.cpp
+ create mode 100644 src/libs/luks2/luks2_userland.cpp
+ create mode 100755 src/tests/system/luks2/qemu/guest-ui-test.sh
+ create mode 100644 src/tests/system/luks2/qemu/locale-settings
+ create mode 100755 src/tests/system/luks2/qemu/run-ui-test.sh
+
+diff --git a/build/jam/images/definitions/minimum b/build/jam/images/definitions/minimum
+index 66f5e35b92..da91b595bb 100644
+--- a/build/jam/images/definitions/minimum
++++ b/build/jam/images/definitions/minimum
+@@ -136,6 +136,7 @@ SYSTEM_APPS = [ FFilterByBuildFeatures
+ 	DiskProbe
+ 	DiskUsage
+ 	DriveSetup
++	EncryptedVolume
+ 	Expander
+ 	Installer
+ 	NetworkStatus
+diff --git a/headers/private/luks2/luks2_userland.h b/headers/private/luks2/luks2_userland.h
+new file mode 100644
+index 0000000000..430487990f
+--- /dev/null
++++ b/headers/private/luks2/luks2_userland.h
+@@ -0,0 +1,76 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef _LUKS2_USERLAND_H
++#define _LUKS2_USERLAND_H
++
++
++/*!	Helpers for userland programs (the luks command, EncryptedVolume,
++	Tracker, DriveSetup).
++
++	luks2_partitions.cpp, without any crypto, so Tracker and DriveSetup can
++	use it: recognising a LUKS2 partition and talking to the luks_disk
++	driver.
++
++	luks2_userland.cpp, with the LUKS2 code: random numbers and choosing KDF
++	parameters for new keyslots.
++*/
++
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <luks2/luks2.h>
++
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++
++// luks2_partitions.cpp
++
++/*!	Tells whether \a path (a partition or disk) starts with a LUKS2 header
++	and returns its label and UUID (both may be NULL). Reads only the binary
++	header; it doesn't check the checksum. */
++bool luks2_partition_label(const char* path, char* label, size_t labelSize,
++	char* uuid, size_t uuidSize);
++
++#ifdef __HAIKU__
++#include <luks2/luks2_driver.h>
++
++/*!	Finds the luks_disk device opened from \a path, if any. */
++status_t luks2_find_open_device(const char* path, luks2_device_info* info);
++
++/*!	Opens \a path with the volume key through the driver; the decrypted
++	device's path goes to \a device. */
++status_t luks2_open_device(const char* path, const uint8_t* key,
++	size_t keySize, bool readOnly, char* device, size_t deviceSize,
++	int32* _id);
++
++status_t luks2_close_device(int32 id);
++#endif
++
++
++// luks2_userland.cpp
++
++/*!	KDF parameters for a new keyslot. 0 means "choose": Argon2 takes at most
++	1 GiB or a quarter of the RAM, 4 lanes, and at least 4 passes, measured
++	single-threaded (as the boot loader computes it) to take about
++	\a iterTimeMs; with less memory if 4 passes take longer. PBKDF2 gets the
++	iterations for \a iterTimeMs. */
++void luks2_choose_kdf(luks2_kdf* kdf, int type, uint32_t iterTimeMs,
++	uint32_t memoryKiB, uint32_t lanes, uint32_t passes,
++	uint32_t iterations);
++
++/*!	Iterations for the volume key's digest: about 1/8 s here. */
++uint32_t luks2_choose_digest_iterations(void);
++
++
++#ifdef __cplusplus
++}
++#endif
++
++
++#endif	// _LUKS2_USERLAND_H
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+index 6e0d4272e1..137498165d 100644
+--- a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+@@ -86,6 +86,8 @@ public:
+ 
+ 			int32				ID() const { return fID; }
+ 			const char*			Path() const { return fPath; }
++			void				SetPath(const char* path)
++									{ strlcpy(fPath, path, sizeof(fPath)); }
+ 			const char*			DeviceName() const { return fDeviceName; }
+ 			off_t				Size() const { return fSize; }
+ 			bool				IsReadOnly() const { return fReadOnly; }
+@@ -145,6 +147,8 @@ private:
+ };
+ 
+ 
++static status_t close_volume(int32 id);
++
+ static mutex sVolumesLock = MUTEX_INITIALIZER("luks volumes");
+ static Volume* sVolumes[LUKS2_MAX_DEVICES];
+ static device_node* sControlNode;
+@@ -562,7 +566,10 @@ Volume::Control(uint32 op, void* buffer, size_t length)
+ 				fSectorSize);
+ 			geometry.bytes_per_physical_sector = fSectorSize;
+ 			geometry.device_type = B_DISK;
+-			geometry.removable = false;
++			geometry.removable = true;
++				// like a disk one can take out: mount_server mounts its
++				// volumes when it's unlocked, and "ejects" it (locks it,
++				// B_EJECT_DEVICE) once its last one is unmounted
+ 			geometry.read_only = fReadOnly;
+ 			geometry.write_once = false;
+ 			return user_memcpy(buffer, &geometry, length);
+@@ -592,6 +599,11 @@ Volume::Control(uint32 op, void* buffer, size_t length)
+ 			// discards would show which blocks are in use
+ 			return B_NOT_SUPPORTED;
+ 
++		case B_EJECT_DEVICE:
++			// "Ejecting" locks the volume again: mount_server does that
++			// after Tracker unmounted its last file system
++			return close_volume(fID);
++
+ 		case LUKS2_IOCTL_GET_DEVICE_INFO:
+ 		{
+ 			if (buffer == NULL || !IS_USER_ADDRESS(buffer)
+@@ -685,6 +697,9 @@ open_volume(const char* rawPath, const uint8* key, size_t keySize,
+ 	if (status != B_OK)
+ 		return status;
+ 
++	// Reserve a slot, then open the device and check the key without the
++	// lock: open() and close() of a device take the device manager's lock,
++	// which init_driver()/uninit_driver() hold when they take ours.
+ 	MutexLocker locker(sVolumesLock);
+ 
+ 	int32 id = -1;
+@@ -703,13 +718,22 @@ open_volume(const char* rawPath, const uint8* key, size_t keySize,
+ 	Volume* volume = new(std::nothrow) Volume(id);
+ 	if (volume == NULL)
+ 		return B_NO_MEMORY;
++	volume->SetPath(path.Path());
++	sVolumes[id] = volume;
++		// no node yet: close and GET_INFO leave it alone
++	locker.Unlock();
++
+ 	status = volume->Init(path.Path(), key, keySize, flags);
+ 	if (status != B_OK) {
++		locker.Lock();
++		sVolumes[id] = NULL;
++		locker.Unlock();
+ 		delete volume;
+ 		return status;
+ 	}
+-	sVolumes[id] = volume;
+-	locker.Unlock();
++
++	// (the volume may be gone as soon as its node exists)
++	snprintf(deviceName, deviceNameSize, "/dev/%s", volume->DeviceName());
+ 
+ 	device_attr attrs[] = {
+ 		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
+@@ -725,15 +749,16 @@ open_volume(const char* rawPath, const uint8* key, size_t keySize,
+ 		ERROR("registering device %" B_PRId32 " failed: %s\n", id,
+ 			strerror(status));
+ 		locker.Lock();
+-		if (sVolumes[id] == volume && volume->Node() == NULL) {
++		bool unused = sVolumes[id] == volume && volume->Node() == NULL;
++		if (unused)
+ 			sVolumes[id] = NULL;
++		locker.Unlock();
++		if (unused)
+ 			delete volume;
+-		}
+ 		return status;
+ 	}
+ 
+ 	*_id = id;
+-	snprintf(deviceName, deviceNameSize, "/dev/%s", volume->DeviceName());
+ 	return B_OK;
+ }
+ 
+@@ -994,7 +1019,8 @@ control_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
+ 				status = B_ENTRY_NOT_FOUND;
+ 				MutexLocker locker(sVolumesLock);
+ 				for (int32 i = id < 0 ? 0 : id; i < LUKS2_MAX_DEVICES; i++) {
+-					if (sVolumes[i] != NULL && !sVolumes[i]->IsClosing()) {
++					if (sVolumes[i] != NULL && !sVolumes[i]->IsClosing()
++						&& sVolumes[i]->Node() != NULL) {
+ 						sVolumes[i]->GetInfo(*info);
+ 						status = B_OK;
+ 						break;
+diff --git a/src/apps/Jamfile b/src/apps/Jamfile
+index c883cf7b07..b7a432bb51 100644
+--- a/src/apps/Jamfile
++++ b/src/apps/Jamfile
+@@ -16,6 +16,7 @@ HaikuSubInclude devices ;
+ HaikuSubInclude diskprobe ;
+ HaikuSubInclude diskusage ;
+ HaikuSubInclude drivesetup ;
++HaikuSubInclude encryptedvolume ;
+ HaikuSubInclude expander ;
+ HaikuSubInclude firstbootprompt ;
+ HaikuSubInclude fontdemo ;
+diff --git a/src/apps/drivesetup/Jamfile b/src/apps/drivesetup/Jamfile
+index 0aa75fe0e2..a59ab0fa34 100644
+--- a/src/apps/drivesetup/Jamfile
++++ b/src/apps/drivesetup/Jamfile
+@@ -3,6 +3,9 @@ SubDir HAIKU_TOP src apps drivesetup ;
+ AddSubDirSupportedPlatforms libbe_test ;
+ 
+ UsePrivateHeaders interface shared storage tracker ;
++SubDirSysHdrs $(HAIKU_TOP) headers private ;
++	# <luks2/...>
++SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src libs luks2 ] ;
+ 
+ Application DriveSetup :
+ 	AbstractParametersPanel.cpp
+@@ -16,6 +19,9 @@ Application DriveSetup :
+ 	PartitionList.cpp
+ 	Support.cpp
+ 
++	# LUKS2 partitions (no crypto)
++	luks2_partitions.cpp
++
+ 	: be localestub libcolumnlistview.a shared tracker
+ 		[ TargetLibsupc++ ]
+ 	: DriveSetup.rdef
+diff --git a/src/apps/drivesetup/MainWindow.cpp b/src/apps/drivesetup/MainWindow.cpp
+index 5b6ad81331..37e538f229 100644
+--- a/src/apps/drivesetup/MainWindow.cpp
++++ b/src/apps/drivesetup/MainWindow.cpp
+@@ -45,9 +45,12 @@
+ #include <Volume.h>
+ #include <VolumeRoster.h>
+ 
++#include <fs_info.h>
+ #include <fs_volume.h>
+ #include <tracker_private.h>
+ 
++#include <luks2/luks2_userland.h>
++
+ #include "ChangeParametersPanel.h"
+ #include "ColumnListView.h"
+ #include "CreateParametersPanel.h"
+@@ -80,6 +83,10 @@ enum {
+ 	MSG_WRITE					= 'writ',
+ 	MSG_COMPLETE				= 'comp',
+ 
++	MSG_UNLOCK					= 'unlk',
++	MSG_LOCK					= 'lock',
++	MSG_ENCRYPT					= 'encr',
++
+ 	MSG_PARTITION_ROW_SELECTED	= 'prsl',
+ };
+ 
+@@ -300,6 +307,18 @@ MainWindow::MainWindow()
+ 
+ 	fPartitionMenu->AddItem(fMountAllMenuItem);
+ 
++	// LUKS2 encrypted volumes, through EncryptedVolume
++	fUnlockMenuItem = new BMenuItem(B_TRANSLATE("Unlock" B_UTF8_ELLIPSIS),
++		new BMessage(MSG_UNLOCK));
++	fLockMenuItem = new BMenuItem(B_TRANSLATE("Lock"),
++		new BMessage(MSG_LOCK));
++	fEncryptMenuItem = new BMenuItem(B_TRANSLATE("Encrypt" B_UTF8_ELLIPSIS),
++		new BMessage(MSG_ENCRYPT));
++	fPartitionMenu->AddSeparatorItem();
++	fPartitionMenu->AddItem(fUnlockMenuItem);
++	fPartitionMenu->AddItem(fLockMenuItem);
++	fPartitionMenu->AddItem(fEncryptMenuItem);
++
+ 	fPartitionMenu->AddSeparatorItem();
+ 
+ 	fPartitionMenu->AddItem(fOpenDiskProbeMenuItem);
+@@ -470,6 +489,26 @@ MainWindow::MessageReceived(BMessage* message)
+ 				_ScanDrives();
+ 			}
+ 			break;
++		case MSG_UNLOCK:
++		case MSG_LOCK:
++		case MSG_ENCRYPT:
++		{
++			PartitionListRow* row = dynamic_cast<PartitionListRow*>(
++				fListView->CurrentSelection());
++			if (row == NULL)
++				break;
++			const char* args[] = { NULL, NULL, NULL };
++			int argc = 0;
++			if (message->what == MSG_LOCK)
++				args[argc++] = "--lock";
++			else if (message->what == MSG_ENCRYPT)
++				args[argc++] = "--encrypt";
++			args[argc++] = row->DevicePath();
++			be_roster->Launch("application/x-vnd.Haiku-EncryptedVolume", argc,
++				args);
++			break;
++		}
++
+ 		case MSG_OPEN_DISKPROBE:
+ 		{
+ 			PartitionListRow* row = dynamic_cast<PartitionListRow*>(
+@@ -1294,7 +1333,10 @@ MainWindow::_UpdateMenus(BDiskDevice* disk,
+ 			}
+ 			fUnmountMenuItem->SetEnabled(unMountable);
+ 			fUnmountContextMenuItem->SetEnabled(unMountable);
++
++			_UpdateEncryptionMenus(partition, writable);
+ 		} else {
++			_UpdateEncryptionMenus(NULL, false);
+ 			fDeleteMenuItem->SetEnabled(false);
+ 			fChangeMenuItem->SetEnabled(false);
+ 			fMountMenuItem->SetEnabled(false);
+@@ -1315,6 +1357,9 @@ MainWindow::_UpdateMenus(BDiskDevice* disk,
+ 
+ 		fMountAllMenuItem->SetEnabled(true);
+ 	}
++	if (disk == NULL || selectedPartition < 0)
++		_UpdateEncryptionMenus(NULL, false);
++
+ 	if (selectedPartition < 0) {
+ 		fDeleteMenuItem->SetEnabled(false);
+ 		fChangeMenuItem->SetEnabled(false);
+@@ -1327,6 +1372,42 @@ MainWindow::_UpdateMenus(BDiskDevice* disk,
+ }
+ 
+ 
++/*!	Unlock and Lock for LUKS2 partitions, Encrypt for partitions without a
++	partition table that aren't in use. */
++void
++MainWindow::_UpdateEncryptionMenus(BPartition* partition, bool writable)
++{
++	bool isEncrypted = false;
++	bool isUnlocked = false;
++	bool holdsBootVolume = false;
++	BPath path;
++	if (partition != NULL && partition->GetPath(&path) == B_OK) {
++		isEncrypted = luks2_partition_label(path.Path(), NULL, 0, NULL, 0);
++		luks2_device_info info;
++		if (isEncrypted
++			&& luks2_find_open_device(path.Path(), &info) == B_OK) {
++			isUnlocked = true;
++			// the boot volume can't be locked
++			BVolume bootVolume;
++			fs_info fsInfo;
++			BString prefix(info.device);
++			prefix.Truncate(prefix.FindLast('/') + 1);
++			holdsBootVolume = BVolumeRoster().GetBootVolume(&bootVolume)
++					== B_OK
++				&& fs_stat_dev(bootVolume.Device(), &fsInfo) == 0
++				&& strncmp(fsInfo.device_name, prefix.String(),
++					prefix.Length()) == 0;
++		}
++	}
++
++	fUnlockMenuItem->SetEnabled(isEncrypted && !isUnlocked);
++	fLockMenuItem->SetEnabled(isUnlocked && !holdsBootVolume);
++	fEncryptMenuItem->SetEnabled(partition != NULL && writable
++		&& !partition->IsMounted() && partition->CountChildren() == 0
++		&& !isUnlocked);
++}
++
++
+ void
+ MainWindow::_DisplayPartitionError(BString _message,
+ 	const BPartition* partition, status_t error) const
+diff --git a/src/apps/drivesetup/MainWindow.h b/src/apps/drivesetup/MainWindow.h
+index 40e8b7f33f..60f3c1363e 100644
+--- a/src/apps/drivesetup/MainWindow.h
++++ b/src/apps/drivesetup/MainWindow.h
+@@ -72,6 +72,8 @@ private:
+ 									partition_id selectedPartition,
+ 									partition_id parentID);
+ 
++			void				_UpdateEncryptionMenus(BPartition* partition,
++									bool writable);
+ 			void				_DisplayPartitionError(BString message,
+ 									const BPartition* partition = NULL,
+ 									status_t error = B_OK) const;
+@@ -125,6 +127,9 @@ private:
+ 			BMenuItem*			fMountMenuItem;
+ 			BMenuItem*			fUnmountMenuItem;
+ 			BMenuItem*			fMountAllMenuItem;
++			BMenuItem*			fUnlockMenuItem;
++			BMenuItem*			fLockMenuItem;
++			BMenuItem*			fEncryptMenuItem;
+ 			BMenuItem*			fOpenDiskProbeMenuItem;
+ 
+ 			BMenu*				fFormatContextMenuItem;
+diff --git a/src/apps/encryptedvolume/EncryptedVolume.cpp b/src/apps/encryptedvolume/EncryptedVolume.cpp
+new file mode 100644
+index 0000000000..27deb815c6
+--- /dev/null
++++ b/src/apps/encryptedvolume/EncryptedVolume.cpp
+@@ -0,0 +1,887 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	EncryptedVolume: unlocks a LUKS2 partition and mounts what's inside,
++	locks it again, or encrypts a partition with a BFS volume inside.
++	Tracker's Mount menu and DriveSetup start it with a partition path:
++
++		EncryptedVolume <partition>				ask for the passphrase, mount
++		EncryptedVolume --encrypt <partition>	new LUKS2 volume with BFS
++		EncryptedVolume --lock <partition>		unmount and lock, no window
++
++	For tests the windows answer the scripting messages 'unlk' and 'encr'
++	(hey EncryptedVolume unlk of Window 0) after the work is done, with the
++	"result" status, "device" and "mount point".
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++#include <Alert.h>
++#include <Application.h>
++#include <Bitmap.h>
++#include <Button.h>
++#include <Catalog.h>
++#include <CheckBox.h>
++#include <DiskDevice.h>
++#include <DiskDeviceRoster.h>
++#include <DiskDeviceVisitor.h>
++#include <Drivers.h>
++#include <Entry.h>
++#include <IconUtils.h>
++#include <LayoutBuilder.h>
++#include <Partition.h>
++#include <Path.h>
++#include <Resources.h>
++#include <Roster.h>
++#include <StringView.h>
++#include <TextControl.h>
++#include <View.h>
++#include <Window.h>
++#include <fs_volume.h>
++
++#include <StringForSize.h>
++
++#include <luks2/luks2.h>
++#include <luks2/luks2_userland.h>
++
++
++#undef B_TRANSLATION_CONTEXT
++#define B_TRANSLATION_CONTEXT "EncryptedVolume"
++
++
++static const char* kSignature = "application/x-vnd.Haiku-EncryptedVolume";
++static const size_t kMaxPassphraseLength = 512;
++
++enum {
++	kMsgUnlock		= 'unlk',
++	kMsgEncrypt		= 'encr',
++	kMsgDone		= 'done',
++	kMsgTextChanged	= 'txch'
++};
++
++enum mode {
++	kUnlockMode,
++	kEncryptMode,
++	kLockMode
++};
++
++
++// #pragma mark - disks
++
++
++/*!	The partition (or disk) whose device is \a path. */
++static status_t
++find_partition(const char* path, BDiskDevice* device, BPartition** _partition)
++{
++	char resolved[B_PATH_NAME_LENGTH];
++	if (realpath(path, resolved) == NULL)
++		strlcpy(resolved, path, sizeof(resolved));
++
++	struct PathVisitor : BDiskDeviceVisitor {
++		PathVisitor(const char* path) : fPath(path) {}
++		virtual bool Visit(BDiskDevice* device)
++		{
++			return Visit(device, 0);
++		}
++		virtual bool Visit(BPartition* partition, int32 level)
++		{
++			BPath path;
++			return partition->GetPath(&path) == B_OK
++				&& strcmp(path.Path(), fPath) == 0;
++		}
++		const char* fPath;
++	} visitor(resolved);
++
++	BDiskDeviceRoster roster;
++	if (!roster.VisitEachPartition(&visitor, device, _partition))
++		return B_ENTRY_NOT_FOUND;
++	return B_OK;
++}
++
++
++
++struct PartitionInfo {
++	BString	label;
++	BString	name;
++	off_t	size;
++	bool	mounted;
++	bool	hasChildren;
++};
++
++
++static status_t
++get_partition_info(const char* path, PartitionInfo& info)
++{
++	BDiskDevice device;
++	BPartition* partition;
++	status_t status = find_partition(path, &device, &partition);
++	if (status != B_OK)
++		return status;
++	info.size = partition->Size();
++	info.mounted = partition->IsMounted();
++	info.hasChildren = partition->CountChildren() > 0;
++	// a partition's name, never a disk's (that's its model)
++	info.name = partition->ContentName();
++	if (info.name.Length() == 0 && !partition->IsDevice())
++		info.name = partition->Name();
++	char label[48];
++	if (luks2_partition_label(path, label, sizeof(label), NULL, 0))
++		info.label = label;
++	return B_OK;
++}
++
++
++static BString
++size_string(off_t size)
++{
++	char buffer[64];
++	return BPrivate::string_for_size(size, buffer, sizeof(buffer));
++}
++
++
++/*!	Mounts the file systems on the decrypted device once the disk device
++	manager knows it (mount_server may mount them first: the device is
++	removable). Returns the first mount point. */
++static status_t
++mount_decrypted_device(const char* devicePath, bool readOnly, BPath& _mountPoint)
++{
++	BDiskDevice device;
++	BPartition* partition = NULL;
++	status_t status = B_ENTRY_NOT_FOUND;
++	for (int i = 0; i < 100; i++) {
++		status = find_partition(devicePath, &device, &partition);
++		if (status == B_OK)
++			break;
++		snooze(100000);
++	}
++	if (status != B_OK)
++		return status;
++
++	struct MountVisitor : BDiskDeviceVisitor {
++		MountVisitor(bool readOnly) : fReadOnly(readOnly), fStatus(B_ERROR) {}
++
++		virtual bool Visit(BDiskDevice* device)
++		{
++			return Visit(device, 0);
++		}
++
++		virtual bool Visit(BPartition* partition, int32 level)
++		{
++			if (!partition->ContainsFileSystem())
++				return false;
++			status_t status = B_OK;
++			if (!partition->IsMounted()) {
++				status = partition->Mount(NULL,
++					fReadOnly ? B_MOUNT_READ_ONLY : 0);
++				if (status == B_BUSY) {
++					// mount_server got there first
++					snooze(300000);
++					status = B_OK;
++				}
++			}
++			if (status == B_OK && fMountPoint.InitCheck() != B_OK)
++				partition->GetMountPoint(&fMountPoint);
++			if (fStatus != B_OK)
++				fStatus = status;
++			return false;
++		}
++
++		bool	fReadOnly;
++		status_t fStatus;
++		BPath	fMountPoint;
++	} visitor(readOnly);
++
++	// mount_server may be mounting it right now: give it a moment
++	snooze(500000);
++	device.Update();
++	device.VisitEachDescendant(&visitor);
++	if (visitor.fStatus != B_OK)
++		return visitor.fStatus == B_ERROR ? B_NO_INIT : visitor.fStatus;
++
++	device.Update();
++	visitor.fMountPoint.Unset();
++	visitor.fStatus = B_ERROR;
++	device.VisitEachDescendant(&visitor);
++	_mountPoint = visitor.fMountPoint;
++	return _mountPoint.InitCheck() == B_OK ? B_OK : B_ERROR;
++}
++
++
++static status_t
++lock_volume(const char* path)
++{
++	luks2_device_info info;
++	status_t status = luks2_find_open_device(path, &info);
++	if (status != B_OK)
++		return status;
++
++	BDiskDevice device;
++	BPartition* partition;
++	if (find_partition(info.device, &device, &partition) == B_OK) {
++		struct UnmountVisitor : BDiskDeviceVisitor {
++			UnmountVisitor() : fStatus(B_OK) {}
++			virtual bool Visit(BDiskDevice* device)
++			{
++				return Visit(device, 0);
++			}
++			virtual bool Visit(BPartition* partition, int32 level)
++			{
++				if (partition->IsMounted()) {
++					status_t status = partition->Unmount();
++					if (status != B_OK)
++						fStatus = status;
++				}
++				return false;
++			}
++			status_t fStatus;
++		} visitor;
++		device.VisitEachDescendant(&visitor);
++		if (visitor.fStatus != B_OK)
++			return visitor.fStatus;
++	}
++	return luks2_close_device(info.id);
++}
++
++
++// #pragma mark - the work, in its own thread
++
++
++struct Job {
++	BMessenger	target;
++	int			mode;
++	BString		path;
++	char*		passphrase;
++	size_t		passphraseLength;
++	bool		readOnly;
++	BString		volumeName;
++};
++
++
++static ssize_t
++fd_read(void* cookie, uint64_t offset, void* buffer, size_t size)
++{
++	return pread(*(int*)cookie, buffer, size, offset);
++}
++
++
++static ssize_t
++fd_write(void* cookie, uint64_t offset, const void* buffer, size_t size)
++{
++	return pwrite(*(int*)cookie, buffer, size, offset);
++}
++
++
++static uint64_t
++fd_size(int fd)
++{
++	device_geometry geometry;
++	if (ioctl(fd, B_GET_GEOMETRY, &geometry, sizeof(geometry)) == 0) {
++		return (uint64_t)geometry.bytes_per_sector
++			* geometry.sectors_per_track * geometry.cylinder_count
++			* geometry.head_count;
++	}
++	struct stat st;
++	if (fstat(fd, &st) == 0)
++		return st.st_size;
++	return 0;
++}
++
++
++static BString
++luks2_message(int error)
++{
++	switch (error) {
++		case LUKS2_ERROR_BAD_PASSPHRASE:
++			return B_TRANSLATE("That passphrase doesn't open this volume.");
++		case LUKS2_ERROR_KDF_MEMORY:
++			return B_TRANSLATE("There isn't enough memory to check the "
++				"passphrase.");
++		case LUKS2_ERROR_UNSUPPORTED:
++			return B_TRANSLATE("The volume uses a LUKS2 feature that isn't "
++				"supported.");
++		case LUKS2_ERROR_CORRUPT:
++			return B_TRANSLATE("The volume's LUKS2 header is damaged.");
++	}
++	return luks2_error_string(error);
++}
++
++
++static status_t
++unlock(Job& job, BMessage& result)
++{
++	int fd = open(job.path.String(), O_RDONLY);
++	if (fd < 0) {
++		result.AddString("error", strerror(errno));
++		return errno;
++	}
++	luks2_device_io io = { &fd, fd_read, NULL, fd_size(fd) };
++	luks2_volume* volume;
++	int luks2Result = luks2_read_header(&io, &volume);
++	uint8_t key[LUKS2_MAX_KEY_SIZE];
++	size_t keySize = 0;
++	if (luks2Result == LUKS2_OK) {
++		luks2Result = luks2_unlock(volume, &io, job.passphrase,
++			job.passphraseLength, -1, key, &keySize, NULL);
++		luks2_free_volume(volume);
++	}
++	close(fd);
++	if (luks2Result != LUKS2_OK) {
++		luks2_wipe(key, sizeof(key));
++		result.AddString("error", luks2_message(luks2Result));
++		return luks2Result == LUKS2_ERROR_BAD_PASSPHRASE
++			? B_PERMISSION_DENIED : B_ERROR;
++	}
++
++	char device[B_PATH_NAME_LENGTH];
++	status_t status = luks2_open_device(job.path.String(), key, keySize,
++		job.readOnly, device, sizeof(device), NULL);
++	luks2_wipe(key, sizeof(key));
++	if (status != B_OK) {
++		result.AddString("error", strerror(status));
++		return status;
++	}
++	result.AddString("device", device);
++
++	BPath mountPoint;
++	status = mount_decrypted_device(device, job.readOnly, mountPoint);
++	if (status != B_OK) {
++		result.AddString("error", B_TRANSLATE("The volume is unlocked, but "
++			"nothing on it could be mounted."));
++		return status;
++	}
++	result.AddString("mount point", mountPoint.Path());
++	return B_OK;
++}
++
++
++static status_t
++encrypt(Job& job, BMessage& result)
++{
++	int fd = open(job.path.String(), O_RDWR);
++	if (fd < 0) {
++		result.AddString("error", strerror(errno));
++		return errno;
++	}
++	luks2_device_io io = { &fd, fd_read, fd_write, fd_size(fd) };
++
++	luks2_format_parameters parameters;
++	memset(&parameters, 0, sizeof(parameters));
++	parameters.label = job.volumeName.String();
++	parameters.sector_size = 512;
++	parameters.key_size = 64;
++	parameters.digest_iterations = luks2_choose_digest_iterations();
++	luks2_choose_kdf(&parameters.kdf, LUKS2_KDF_ARGON2ID, 2000, 0, 4, 0, 0);
++
++	uint8_t key[LUKS2_MAX_KEY_SIZE];
++	size_t keySize = 0;
++	int luks2Result = luks2_format(&io, &parameters, job.passphrase,
++		job.passphraseLength, key, &keySize);
++	fsync(fd);
++	close(fd);
++	if (luks2Result != LUKS2_OK) {
++		luks2_wipe(key, sizeof(key));
++		result.AddString("error", luks2_message(luks2Result));
++		return B_ERROR;
++	}
++
++	char device[B_PATH_NAME_LENGTH];
++	status_t status = luks2_open_device(job.path.String(), key, keySize, false,
++		device, sizeof(device), NULL);
++	luks2_wipe(key, sizeof(key));
++	if (status != B_OK) {
++		result.AddString("error", strerror(status));
++		return status;
++	}
++	result.AddString("device", device);
++
++	// a BFS volume on the decrypted device
++	BDiskDevice disk;
++	BPartition* partition = NULL;
++	status = B_ENTRY_NOT_FOUND;
++	for (int i = 0; i < 100 && status != B_OK; i++) {
++		status = find_partition(device, &disk, &partition);
++		if (status != B_OK)
++			snooze(100000);
++	}
++	if (status == B_OK)
++		status = disk.PrepareModifications();
++	if (status == B_OK) {
++		status = partition->Initialize("Be File System",
++			job.volumeName.String(), "");
++		if (status == B_OK)
++			status = disk.CommitModifications();
++		else
++			disk.CancelModifications();
++	}
++	if (status != B_OK) {
++		result.AddString("error", BString(B_TRANSLATE("The volume is "
++			"encrypted and unlocked, but BFS couldn't be put on it: "))
++			<< strerror(status));
++		return status;
++	}
++
++	BPath mountPoint;
++	status = mount_decrypted_device(device, false, mountPoint);
++	if (status != B_OK) {
++		result.AddString("error", B_TRANSLATE("The new volume couldn't be "
++			"mounted."));
++		return status;
++	}
++	result.AddString("mount point", mountPoint.Path());
++	return B_OK;
++}
++
++
++static status_t
++job_thread(void* data)
++{
++	Job* job = (Job*)data;
++	BMessage result(kMsgDone);
++	status_t status = job->mode == kUnlockMode
++		? unlock(*job, result) : encrypt(*job, result);
++	result.AddInt32("result", status);
++
++	luks2_wipe(job->passphrase, kMaxPassphraseLength + 1);
++	free(job->passphrase);
++	job->target.SendMessage(&result);
++	delete job;
++	return B_OK;
++}
++
++
++// #pragma mark - window
++
++
++class IconView : public BView {
++public:
++	IconView()
++		:
++		BView("icon", B_WILL_DRAW),
++		fIcon(NULL)
++	{
++		SetDrawingMode(B_OP_ALPHA);
++		size_t size;
++		const void* data = be_app->AppResources()->LoadResource('VICN',
++			"BEOS:ICON", &size);
++		if (data != NULL) {
++			fIcon = new BBitmap(BRect(0, 0, 63, 63), B_RGBA32);
++			if (BIconUtils::GetVectorIcon((const uint8*)data, size, fIcon)
++					!= B_OK) {
++				delete fIcon;
++				fIcon = NULL;
++			}
++		}
++		SetExplicitSize(BSize(63, 63));
++	}
++
++	~IconView()
++	{
++		delete fIcon;
++	}
++
++	virtual void AttachedToWindow()
++	{
++		AdoptParentColors();
++	}
++
++	virtual void Draw(BRect)
++	{
++		if (fIcon != NULL)
++			DrawBitmap(fIcon, BPoint(0, 0));
++	}
++
++private:
++	BBitmap*	fIcon;
++};
++
++
++class VolumeWindow : public BWindow {
++public:
++								VolumeWindow(int mode, const char* path);
++	virtual						~VolumeWindow();
++
++	virtual	void				MessageReceived(BMessage* message);
++
++private:
++			void				_Start(BMessage* request);
++			void				_Done(BMessage* message);
++			void				_SetBusy(bool busy, const char* status);
++			void				_UpdateButton();
++			void				_ReplyToScript(BMessage& reply);
++
++private:
++			int					fMode;
++			BString				fPath;
++			BTextControl*		fName;
++			BTextControl*		fPassphrase;
++			BTextControl*		fRepeat;
++			BCheckBox*			fReadOnly;
++			BStringView*		fStatus;
++			BButton*			fOK;
++			BButton*			fCancel;
++			BMessage*			fScriptRequest;
++			bool				fBusy;
++};
++
++
++VolumeWindow::VolumeWindow(int mode, const char* path)
++	:
++	BWindow(BRect(0, 0, 400, 200), mode == kUnlockMode
++			? B_TRANSLATE("Unlock encrypted volume")
++			: B_TRANSLATE("Encrypt partition"),
++		B_TITLED_WINDOW, B_NOT_ZOOMABLE | B_NOT_RESIZABLE
++			| B_AUTO_UPDATE_SIZE_LIMITS | B_QUIT_ON_WINDOW_CLOSE),
++	fMode(mode),
++	fPath(path),
++	fName(NULL),
++	fRepeat(NULL),
++	fReadOnly(NULL),
++	fScriptRequest(NULL),
++	fBusy(false)
++{
++	PartitionInfo info;
++	info.size = 0;
++	get_partition_info(path, info);
++
++	BString title;
++	BString detail;
++	if (mode == kUnlockMode) {
++		title = B_TRANSLATE("Unlock \"%label%\" (%size%)");
++		title.ReplaceFirst("%label%", info.label.Length() > 0
++			? info.label.String() : B_TRANSLATE("unnamed"));
++		detail = path;
++	} else {
++		title = B_TRANSLATE("Encrypt %path% (%size%)");
++		title.ReplaceFirst("%path%", path);
++		detail = B_TRANSLATE("Everything on this partition will be lost.");
++	}
++	title.ReplaceFirst("%size%", size_string(info.size).String());
++
++	BStringView* titleView = new BStringView("title", title.String());
++	titleView->SetFont(be_bold_font);
++	BStringView* detailView = new BStringView("detail", detail.String());
++
++	fPassphrase = new BTextControl("passphrase", B_TRANSLATE("Passphrase:"),
++		"", new BMessage(kMsgTextChanged));
++	fPassphrase->TextView()->HideTyping(true);
++	fPassphrase->SetModificationMessage(new BMessage(kMsgTextChanged));
++
++	fStatus = new BStringView("status", "");
++	fCancel = new BButton("cancel", B_TRANSLATE("Cancel"),
++		new BMessage(B_QUIT_REQUESTED));
++	fOK = new BButton("ok", mode == kUnlockMode ? B_TRANSLATE("Unlock")
++		: B_TRANSLATE("Encrypt"),
++		new BMessage(mode == kUnlockMode ? kMsgUnlock : kMsgEncrypt));
++
++	BLayoutBuilder::Grid<> grid(B_USE_DEFAULT_SPACING, B_USE_SMALL_SPACING);
++	int32 row = 0;
++	if (mode == kEncryptMode) {
++		fName = new BTextControl("name", B_TRANSLATE("Volume name:"),
++			info.name.Length() > 0 ? info.name.String() : "Encrypted",
++			new BMessage(kMsgTextChanged));
++		fName->SetModificationMessage(new BMessage(kMsgTextChanged));
++		grid.AddTextControl(fName, 0, row++);
++	}
++	grid.AddTextControl(fPassphrase, 0, row++);
++	if (mode == kEncryptMode) {
++		fRepeat = new BTextControl("repeat", B_TRANSLATE("Repeat:"), "",
++			new BMessage(kMsgTextChanged));
++		fRepeat->TextView()->HideTyping(true);
++		fRepeat->SetModificationMessage(new BMessage(kMsgTextChanged));
++		grid.AddTextControl(fRepeat, 0, row++);
++	} else {
++		fReadOnly = new BCheckBox("read only", B_TRANSLATE("Read-only"),
++			NULL);
++		grid.Add(fReadOnly, 1, row++);
++	}
++
++	BLayoutBuilder::Group<>(this, B_VERTICAL)
++		.SetInsets(B_USE_WINDOW_SPACING)
++		.AddGroup(B_HORIZONTAL)
++			.Add(new IconView())
++			.AddGroup(B_VERTICAL, B_USE_SMALL_SPACING)
++				.Add(titleView)
++				.Add(detailView)
++				.Add(grid.View())
++			.End()
++		.End()
++		.Add(fStatus)
++		.AddGroup(B_HORIZONTAL)
++			.AddGlue()
++			.Add(fCancel)
++			.Add(fOK)
++		.End();
++
++	fOK->MakeDefault(true);
++	fPassphrase->MakeFocus(true);
++	_UpdateButton();
++	CenterOnScreen();
++}
++
++
++VolumeWindow::~VolumeWindow()
++{
++	delete fScriptRequest;
++}
++
++
++void
++VolumeWindow::_SetBusy(bool busy, const char* status)
++{
++	fBusy = busy;
++	fStatus->SetText(status);
++	fPassphrase->SetEnabled(!busy);
++	if (fName != NULL)
++		fName->SetEnabled(!busy);
++	if (fRepeat != NULL)
++		fRepeat->SetEnabled(!busy);
++	if (fReadOnly != NULL)
++		fReadOnly->SetEnabled(!busy);
++	fCancel->SetEnabled(!busy);
++	_UpdateButton();
++}
++
++
++void
++VolumeWindow::_UpdateButton()
++{
++	bool enabled = !fBusy && fPassphrase->Text()[0] != '\0';
++	if (fMode == kEncryptMode) {
++		enabled = enabled && fName->Text()[0] != '\0'
++			&& strcmp(fPassphrase->Text(), fRepeat->Text()) == 0;
++	}
++	fOK->SetEnabled(enabled);
++}
++
++
++void
++VolumeWindow::_ReplyToScript(BMessage& reply)
++{
++	if (fScriptRequest == NULL)
++		return;
++	fScriptRequest->SendReply(&reply);
++	delete fScriptRequest;
++	fScriptRequest = NULL;
++}
++
++
++void
++VolumeWindow::_Start(BMessage* request)
++{
++	if (fBusy || !fOK->IsEnabled()) {
++		if (request->IsSourceWaiting()) {
++			BMessage reply(B_REPLY);
++			reply.AddInt32("result", B_NOT_ALLOWED);
++			reply.AddString("error", "not ready");
++			request->SendReply(&reply);
++		}
++		return;
++	}
++
++	if (fMode == kEncryptMode && !request->IsSourceWaiting()) {
++		BString text(B_TRANSLATE("Encrypting %path% erases everything on it. "
++			"Continue?"));
++		text.ReplaceFirst("%path%", fPath.String());
++		BAlert* alert = new BAlert(B_TRANSLATE("Encrypt partition"),
++			text.String(), B_TRANSLATE("Cancel"), B_TRANSLATE("Encrypt"),
++			NULL, B_WIDTH_AS_USUAL, B_WARNING_ALERT);
++		alert->SetShortcut(0, B_ESCAPE);
++		if (alert->Go() != 1)
++			return;
++	}
++
++	if (request->IsSourceWaiting())
++		fScriptRequest = DetachCurrentMessage();
++
++	Job* job = new Job;
++	job->target = BMessenger(this);
++	job->mode = fMode;
++	job->path = fPath;
++	job->passphrase = (char*)calloc(1, kMaxPassphraseLength + 1);
++	strlcpy(job->passphrase, fPassphrase->Text(), kMaxPassphraseLength + 1);
++	job->passphraseLength = strlen(job->passphrase);
++	job->readOnly = fReadOnly != NULL && fReadOnly->Value() == B_CONTROL_ON;
++	if (fName != NULL)
++		job->volumeName = fName->Text();
++
++	// the passphrase only lives in the job from now on
++	fPassphrase->SetText("");
++	if (fRepeat != NULL)
++		fRepeat->SetText("");
++
++	_SetBusy(true, fMode == kUnlockMode ? B_TRANSLATE("Unlocking…")
++		: B_TRANSLATE("Encrypting…"));
++
++	thread_id thread = spawn_thread(job_thread, "encrypted volume job",
++		B_NORMAL_PRIORITY, job);
++	if (thread < 0 || resume_thread(thread) != B_OK) {
++		luks2_wipe(job->passphrase, kMaxPassphraseLength + 1);
++		free(job->passphrase);
++		delete job;
++		_SetBusy(false, strerror(thread));
++	}
++}
++
++
++void
++VolumeWindow::_Done(BMessage* message)
++{
++	status_t result = message->GetInt32("result", B_ERROR);
++	BMessage reply(B_REPLY);
++	reply.AddInt32("result", result);
++	const char* text;
++	if (message->FindString("error", &text) == B_OK)
++		reply.AddString("error", text);
++	if (message->FindString("device", &text) == B_OK)
++		reply.AddString("device", text);
++	if (message->FindString("mount point", &text) == B_OK)
++		reply.AddString("mount point", text);
++	_ReplyToScript(reply);
++
++	if (result != B_OK) {
++		_SetBusy(false, message->GetString("error", strerror(result)));
++		fPassphrase->MakeFocus(true);
++		return;
++	}
++
++	// show the volume in Tracker
++	const char* mountPoint;
++	entry_ref ref;
++	if (message->FindString("mount point", &mountPoint) == B_OK
++		&& get_ref_for_path(mountPoint, &ref) == B_OK) {
++		be_roster->Launch(&ref);
++	}
++	PostMessage(B_QUIT_REQUESTED);
++}
++
++
++void
++VolumeWindow::MessageReceived(BMessage* message)
++{
++	switch (message->what) {
++		case kMsgTextChanged:
++			_UpdateButton();
++			break;
++
++		case kMsgUnlock:
++		case kMsgEncrypt:
++			_Start(message);
++			break;
++
++		case kMsgDone:
++			_Done(message);
++			break;
++
++		default:
++			BWindow::MessageReceived(message);
++			break;
++	}
++}
++
++
++// #pragma mark - application
++
++
++class EncryptedVolumeApp : public BApplication {
++public:
++	EncryptedVolumeApp()
++		:
++		BApplication(kSignature),
++		fMode(kUnlockMode)
++	{
++	}
++
++	virtual void ArgvReceived(int32 argc, char** argv)
++	{
++		int mode = kUnlockMode;
++		const char* path = NULL;
++		for (int32 i = 1; i < argc; i++) {
++			if (strcmp(argv[i], "--encrypt") == 0)
++				mode = kEncryptMode;
++			else if (strcmp(argv[i], "--lock") == 0)
++				mode = kLockMode;
++			else
++				path = argv[i];
++		}
++		if (path == NULL)
++			return;
++		fMode = mode;
++		fPath = path;
++	}
++
++	virtual void ReadyToRun()
++	{
++		if (fPath.Length() == 0) {
++			_Fail(B_TRANSLATE("Start EncryptedVolume with the path of an "
++				"encrypted partition, from Tracker's Mount menu or from "
++				"DriveSetup."));
++			return;
++		}
++
++		if (fMode == kLockMode) {
++			status_t status = lock_volume(fPath.String());
++			if (status != B_OK) {
++				BString text(B_TRANSLATE("Locking %path% failed: %error%"));
++				text.ReplaceFirst("%path%", fPath.String());
++				text.ReplaceFirst("%error%", strerror(status));
++				_Fail(text.String());
++				return;
++			}
++			Quit();
++			return;
++		}
++
++		if (fMode == kUnlockMode) {
++			luks2_device_info info;
++			if (!luks2_partition_label(fPath.String(), NULL, 0, NULL, 0)) {
++				BString text(B_TRANSLATE("%path% isn't an encrypted (LUKS2) "
++					"volume."));
++				text.ReplaceFirst("%path%", fPath.String());
++				_Fail(text.String());
++				return;
++			}
++			if (luks2_find_open_device(fPath.String(), &info) == B_OK) {
++				BString text(B_TRANSLATE("%path% is unlocked already, as "
++					"%device%."));
++				text.ReplaceFirst("%path%", fPath.String());
++				text.ReplaceFirst("%device%", info.device);
++				_Fail(text.String());
++				return;
++			}
++		}
++
++		(new VolumeWindow(fMode, fPath.String()))->Show();
++	}
++
++private:
++	void _Fail(const char* text)
++	{
++		BAlert* alert = new BAlert(B_TRANSLATE("Encrypted volume"), text,
++			B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
++		alert->Go();
++		Quit();
++	}
++
++private:
++	int		fMode;
++	BString	fPath;
++};
++
++
++int
++main()
++{
++	EncryptedVolumeApp app;
++	app.Run();
++	return 0;
++}
+diff --git a/src/apps/encryptedvolume/EncryptedVolume.rdef b/src/apps/encryptedvolume/EncryptedVolume.rdef
+new file mode 100644
+index 0000000000..5c167df74e
+--- /dev/null
++++ b/src/apps/encryptedvolume/EncryptedVolume.rdef
+@@ -0,0 +1,29 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++resource app_signature "application/x-vnd.Haiku-EncryptedVolume";
++
++resource app_flags B_MULTIPLE_LAUNCH;
++
++resource app_version {
++	major  = 1,
++	middle = 0,
++	minor  = 0,
++
++	variety = B_APPV_FINAL,
++	internal = 0,
++
++	short_info = "EncryptedVolume",
++	long_info = "Unlocks, locks and creates LUKS2 encrypted volumes."
++};
++
++// the lock icon DriveSetup shows for encrypted partitions (icons.h)
++resource vector_icon {
++	$"6E636966030501020006053C000000000000000040000049BFFF46800000F0C6"
++	$"053EE8EB4474F0C605B9FFD50EE0F0C606020116030000003C6000BB80000000"
++	$"0049A00048C0008AFF42ACDFAC020A042B40514051592B590405FE01473A4733"
++	$"4733472F3E29442938293533352F35333A040A0001011001178A10040A000100"
++	$"1001178622040A010100000A020101100117851004"
++};
+diff --git a/src/apps/encryptedvolume/Jamfile b/src/apps/encryptedvolume/Jamfile
+new file mode 100644
+index 0000000000..2668a54121
+--- /dev/null
++++ b/src/apps/encryptedvolume/Jamfile
+@@ -0,0 +1,41 @@
++SubDir HAIKU_TOP src apps encryptedvolume ;
++
++UsePrivateHeaders shared storage ;
++SubDirSysHdrs $(HAIKU_TOP) headers private ;
++
++# the LUKS2 code shared with the kernel driver, the boot loader and luks
++local luks2Dir = [ FDirName $(HAIKU_TOP) src libs luks2 ] ;
++SEARCH_SOURCE += $(luks2Dir) ;
++SEARCH_SOURCE += [ FDirName $(luks2Dir) crypto ] ;
++SEARCH_SOURCE += [ FDirName $(luks2Dir) arch x86 ] ;
++
++local accelerators ;
++if $(TARGET_ARCH) = x86_64 {
++	accelerators = aes_ni.cpp ;
++}
++
++Application EncryptedVolume :
++	EncryptedVolume.cpp
++
++	json.cpp
++	luks2_partitions.cpp
++	luks2_read.cpp
++	luks2_userland.cpp
++	luks2_util.cpp
++	luks2_write.cpp
++
++	aes_ct.c
++	aes_xts.cpp
++	argon2.cpp
++	sha2_hmac.cpp
++	$(accelerators)
++
++	: be localestub shared [ TargetLibsupc++ ]
++	: EncryptedVolume.rdef
++;
++
++DoCatalogs EncryptedVolume :
++	x-vnd.Haiku-EncryptedVolume
++	:
++	EncryptedVolume.cpp
++;
+diff --git a/src/bin/luks/Jamfile b/src/bin/luks/Jamfile
+index 46a0afb6b6..3999329af6 100644
+--- a/src/bin/luks/Jamfile
++++ b/src/bin/luks/Jamfile
+@@ -20,6 +20,8 @@ Application luks :
+ 	luks2_read.cpp
+ 	luks2_util.cpp
+ 	luks2_write.cpp
++	luks2_userland.cpp
++	luks2_partitions.cpp
+ 
+ 	aes_ct.c
+ 	aes_xts.cpp
+diff --git a/src/bin/luks/luks.cpp b/src/bin/luks/luks.cpp
+index 6c7e3dbf7c..e34c6eca29 100644
+--- a/src/bin/luks/luks.cpp
++++ b/src/bin/luks/luks.cpp
+@@ -26,16 +26,14 @@
+ #include <unistd.h>
+ 
+ #include <luks2/luks2.h>
++#include <luks2/luks2_userland.h>
+ 
+ #ifdef __HAIKU__
+ #	include <Drivers.h>
+ #	include <OS.h>
+ #	include <luks2/luks2_driver.h>
+-#else
+-#	include <sys/random.h>
+-#	ifdef __linux__
+-#		include <linux/fs.h>
+-#	endif
++#elif defined(__linux__)
++#	include <linux/fs.h>
+ #endif
+ 
+ 
+@@ -68,45 +66,6 @@ struct Options {
+ static Options sOptions;
+ 
+ 
+-// #pragma mark - random numbers
+-
+-
+-int
+-luks2_random(void* buffer, size_t size)
+-{
+-#ifdef __HAIKU__
+-	int fd = open("/dev/urandom", O_RDONLY);
+-	if (fd < 0)
+-		return -1;
+-	uint8_t* bytes = (uint8_t*)buffer;
+-	while (size > 0) {
+-		ssize_t bytesRead = read(fd, bytes, size);
+-		if (bytesRead <= 0) {
+-			close(fd);
+-			return -1;
+-		}
+-		bytes += bytesRead;
+-		size -= bytesRead;
+-	}
+-	close(fd);
+-	return 0;
+-#else
+-	uint8_t* bytes = (uint8_t*)buffer;
+-	while (size > 0) {
+-		ssize_t bytesRead = getrandom(bytes, size, 0);
+-		if (bytesRead < 0) {
+-			if (errno == EINTR)
+-				continue;
+-			return -1;
+-		}
+-		bytes += bytesRead;
+-		size -= bytesRead;
+-	}
+-	return 0;
+-#endif
+-}
+-
+-
+ // #pragma mark - devices
+ 
+ 
+@@ -331,100 +290,14 @@ get_passphrase(const char* keyFile, const char* prompt, bool confirm,
+ // #pragma mark - KDF parameters
+ 
+ 
+-static double
+-now()
+-{
+-	struct timespec time;
+-	clock_gettime(CLOCK_MONOTONIC, &time);
+-	return time.tv_sec + time.tv_nsec / 1e9;
+-}
+-
+-
+-static uint64_t
+-physical_memory_kib()
+-{
+-#ifdef __HAIKU__
+-	system_info info;
+-	if (get_system_info(&info) == B_OK)
+-		return (uint64_t)info.max_pages * B_PAGE_SIZE / 1024;
+-	return 512 * 1024;
+-#else
+-	long pages = sysconf(_SC_PHYS_PAGES);
+-	long pageSize = sysconf(_SC_PAGESIZE);
+-	if (pages > 0 && pageSize > 0)
+-		return (uint64_t)pages * pageSize / 1024;
+-	return 512 * 1024;
+-#endif
+-}
+-
+-
+-/*!	Fills in the KDF parameters from the options, measuring this machine
+-	for whatever wasn't given. Argon2 is measured single-threaded, as the
+-	boot loader computes it. */
++/*!	Fills in the KDF parameters from the options; whatever wasn't given is
++	measured on this machine (luks2_choose_kdf()). */
+ static bool
+ choose_kdf(luks2_kdf& kdf)
+ {
+-	memset(&kdf, 0, sizeof(kdf));
+-	kdf.type = sOptions.kdfType;
+-	double target = sOptions.iterTime / 1000.0;
+-	const char* salt = "benchmark salt..";
+-
+-	if (kdf.type == LUKS2_KDF_PBKDF2) {
+-		kdf.hash = LUKS2_HASH_SHA256;
+-		kdf.iterations = sOptions.iterations;
+-		if (kdf.iterations == 0) {
+-			uint8_t out[64];
+-			uint32_t count = 1000;
+-			double elapsed;
+-			while (true) {
+-				double start = now();
+-				luks2_pbkdf2(LUKS2_HASH_SHA256, "passphrase", 10, salt, 16,
+-					count, out, 64);
+-				elapsed = now() - start;
+-				if (elapsed > 0.1 || count > (1u << 30))
+-					break;
+-				count *= 4;
+-			}
+-			// 64 bytes of output are two PBKDF2 blocks
+-			double rate = count * 2 / elapsed;
+-			kdf.iterations = (uint32_t)(rate * target / 2);
+-			if (kdf.iterations < 1000)
+-				kdf.iterations = 1000;
+-		}
+-		return true;
+-	}
+-
+-	kdf.cpus = sOptions.parallel != 0 ? sOptions.parallel : 4;
+-	kdf.memory = sOptions.memory;
+-	if (kdf.memory == 0) {
+-		uint64_t memory = physical_memory_kib() / 4;
+-		if (memory > 1024 * 1024)
+-			memory = 1024 * 1024;
+-		kdf.memory = (uint32_t)memory;
+-	}
+-	if (kdf.memory < 8 * kdf.cpus)
+-		kdf.memory = 8 * kdf.cpus;
+-	kdf.time = sOptions.time;
+-
+-	if (kdf.time == 0) {
+-		// one pass over a sample, then scale
+-		uint32_t sample = kdf.memory < 64 * 1024 ? kdf.memory : 64 * 1024;
+-		uint8_t out[64];
+-		double start = now();
+-		luks2_argon2(kdf.type == LUKS2_KDF_ARGON2I ? LUKS2_ARGON2I
+-				: LUKS2_ARGON2ID, 1, sample, kdf.cpus, "passphrase", 10, salt,
+-			16, NULL, 0, NULL, 0, out, 64);
+-		double perKiB = (now() - start) / sample;
+-		double passTime = perKiB * kdf.memory;
+-		kdf.time = (uint32_t)(target / passTime);
+-		if (kdf.time < 4) {
+-			// at least four passes, as cryptsetup; less memory instead
+-			kdf.time = 4;
+-			uint64_t memory = (uint64_t)(target / 4 / perKiB);
+-			if (memory < kdf.memory)
+-				kdf.memory = memory < 32 * 1024 ? 32 * 1024 : (uint32_t)memory;
+-		}
+-	}
++	luks2_choose_kdf(&kdf, sOptions.kdfType, sOptions.iterTime,
++		sOptions.memory, sOptions.parallel, sOptions.time,
++		sOptions.iterations);
+ 	return true;
+ }
+ 
+@@ -434,13 +307,7 @@ choose_digest_iterations()
+ {
+ 	if (sOptions.digestIterations != 0)
+ 		return sOptions.digestIterations;
+-	// like the keyslots, measured: about 1/8 s on this machine
+-	uint8_t out[32];
+-	double start = now();
+-	luks2_pbkdf2(LUKS2_HASH_SHA256, "key", 3, "salt", 4, 100000, out, 32);
+-	double rate = 100000 / (now() - start);
+-	uint32_t iterations = (uint32_t)(rate / 8);
+-	return iterations < 1000 ? 1000 : iterations;
++	return luks2_choose_digest_iterations();
+ }
+ 
+ 
+@@ -840,40 +707,26 @@ command_open(const char* path)
+ 	if (volume == NULL)
+ 		return 1;
+ 
+-	luks2_open_request request;
+-	memset(&request, 0, sizeof(request));
++	uint8_t key[LUKS2_MAX_KEY_SIZE];
+ 	size_t keySize;
+-	int result = unlock_volume(volume, device, request.key, &keySize, NULL);
++	int result = unlock_volume(volume, device, key, &keySize, NULL);
+ 	luks2_free_volume(volume);
+ 	close(device.fd);
+ 	if (result != LUKS2_OK) {
+-		luks2_wipe(&request, sizeof(request));
++		luks2_wipe(key, sizeof(key));
+ 		return 2;
+ 	}
+ 
+-	request.version = LUKS2_DRIVER_INTERFACE_VERSION;
+-	request.flags = sOptions.readOnly ? LUKS2_OPEN_READ_ONLY : 0;
+-	request.key_size = keySize;
+-	if (realpath(path, request.path) == NULL)
+-		strlcpy(request.path, path, sizeof(request.path));
+-
+-	int control = open_control_device();
+-	if (control < 0) {
+-		luks2_wipe(&request, sizeof(request));
+-		return 1;
+-	}
+-	status_t status = ioctl(control, LUKS2_IOCTL_OPEN, &request,
+-		sizeof(request));
+-	if (status != 0)
+-		status = errno;
+-	close(control);
+-	luks2_wipe(request.key, sizeof(request.key));
++	char decrypted[PATH_MAX];
++	status_t status = luks2_open_device(path, key, keySize, sOptions.readOnly,
++		decrypted, sizeof(decrypted), NULL);
++	luks2_wipe(key, sizeof(key));
+ 	if (status != B_OK) {
+ 		fprintf(stderr, "%s: opening %s failed: %s\n", kProgramName, path,
+ 			strerror(status));
+ 		return 1;
+ 	}
+-	printf("%s\n", request.device);
++	printf("%s\n", decrypted);
+ 	return 0;
+ }
+ 
+@@ -903,15 +756,7 @@ command_close(const char* argument)
+ 			argument);
+ 		return 1;
+ 	}
+-	int control = open_control_device();
+-	if (control < 0)
+-		return 1;
+-	luks2_close_request request = { LUKS2_DRIVER_INTERFACE_VERSION, id };
+-	status_t status = ioctl(control, LUKS2_IOCTL_CLOSE, &request,
+-		sizeof(request));
+-	if (status != 0)
+-		status = errno;
+-	close(control);
++	status_t status = luks2_close_device(id);
+ 	if (status != B_OK) {
+ 		fprintf(stderr, "%s: closing device %d failed: %s\n", kProgramName,
+ 			(int)id, strerror(status));
+diff --git a/src/kits/tracker/Commands.h b/src/kits/tracker/Commands.h
+index 19a1872c06..0307de0ed3 100644
+--- a/src/kits/tracker/Commands.h
++++ b/src/kits/tracker/Commands.h
+@@ -86,6 +86,7 @@ const uint32 kAddPrinter = 'Tadp';
+ const uint32 kMakeActivePrinter = 'Tmap';
+ 
+ const uint32 kRunAutomounterSettings = 'Tram';
++const uint32 kUnlockEncryptedVolume = 'Tulk';
+ 
+ const uint32 kOpenParentDir = 'Topt';
+ const uint32 kOpenDir = 'Topd';
+diff --git a/src/kits/tracker/Jamfile b/src/kits/tracker/Jamfile
+index b60d34589b..5baea0e3e5 100644
+--- a/src/kits/tracker/Jamfile
++++ b/src/kits/tracker/Jamfile
+@@ -5,6 +5,8 @@ AddSubDirSupportedPlatforms libbe_test ;
+ UseHeaders [ FDirName $(HAIKU_TOP) src add-ons input_server filters shortcut_catcher ] ;
+ UsePrivateHeaders interface mount shared storage support tracker ;
+ UsePrivateSystemHeaders ;
++SubDirSysHdrs $(HAIKU_TOP) headers private ;
++	# <luks2/...>
+ 
+ SubDirC++Flags
+ 	-D_BUILDING_tracker=1
+@@ -22,8 +24,12 @@ for architectureObject in [ MultiArchSubDirSetup ] {
+ 		SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src add-ons input_server
+ 			filters shortcut_catcher ] ;
+ 		SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src kits tracker infowindow ] ;
++		SEARCH_SOURCE += [ FDirName $(HAIKU_TOP) src libs luks2 ] ;
+ 
+ 		SharedLibrary $(libtracker) :
++			# LUKS2 partitions for the Mount menu (no crypto)
++			luks2_partitions.cpp
++
+ 			AttributeStream.cpp
+ 			AttributesView.cpp
+ 			AutoMounterSettings.cpp
+diff --git a/src/kits/tracker/MountMenu.cpp b/src/kits/tracker/MountMenu.cpp
+index f496a820c1..65c89b22fa 100644
+--- a/src/kits/tracker/MountMenu.cpp
++++ b/src/kits/tracker/MountMenu.cpp
+@@ -56,6 +56,9 @@ All rights reserved.
+ 
+ #include <DiskDevice.h>
+ #include <DiskDeviceList.h>
++#include <Path.h>
++
++#include <luks2/luks2_userland.h>
+ 
+ #define SHOW_NETWORK_VOLUMES
+ 
+@@ -72,6 +75,8 @@ public:
+ 	virtual bool Visit(BPartition* partition, int32 level);
+ 
+ private:
++	void AddEncryptedVolume(BPartition* partition);
++
+ 	BMenu* fMenu;
+ };
+ 
+@@ -98,11 +103,49 @@ AddMenuItemVisitor::Visit(BDiskDevice* device)
+ }
+ 
+ 
++/*!	A locked LUKS2 volume: "Unlock ..." starts EncryptedVolume, which asks
++	for the passphrase and mounts what's inside. Once it's unlocked, the
++	volumes on the decrypted device are listed like any other. */
++void
++AddMenuItemVisitor::AddEncryptedVolume(BPartition* partition)
++{
++	if (partition->CountChildren() > 0 || partition->ContentType() != NULL)
++		return;
++
++	BPath path;
++	char label[48];
++	if (partition->GetPath(&path) != B_OK
++		|| !luks2_partition_label(path.Path(), label, sizeof(label), NULL, 0)) {
++		return;
++	}
++	luks2_device_info info;
++	if (luks2_find_open_device(path.Path(), &info) == B_OK)
++		return;
++
++	uint32 divisor = 1UL << 30;
++	char unit = 'G';
++	if (partition->Size() < divisor) {
++		divisor = 1UL << 20;
++		unit = 'M';
++	}
++	BString name;
++	name.SetToFormat(B_TRANSLATE("Unlock \"%s\" (%.1f %cB, encrypted)"
++		B_UTF8_ELLIPSIS), label[0] != '\0' ? label : B_TRANSLATE("unnamed"),
++		1.0 * partition->Size() / divisor, unit);
++
++	BMessage* message = new BMessage(kUnlockEncryptedVolume);
++	message->AddString("path", path.Path());
++	fMenu->AddItem(new BMenuItem(name.String(), message));
++}
++
++
+ bool
+ AddMenuItemVisitor::Visit(BPartition* partition, int32 level)
+ {
+-	if (!partition->ContainsFileSystem())
++	if (!partition->ContainsFileSystem()) {
++		AddEncryptedVolume(partition);
+ 		return false;
++	}
+ 
+ 	// get name (and eventually the type)
+ 	BString name = partition->ContentName();
+diff --git a/src/kits/tracker/Tracker.cpp b/src/kits/tracker/Tracker.cpp
+index a67c68d1f7..92bdd800fb 100644
+--- a/src/kits/tracker/Tracker.cpp
++++ b/src/kits/tracker/Tracker.cpp
+@@ -545,6 +545,18 @@ TTracker::MessageReceived(BMessage* message)
+ 			break;
+ 		}
+ 
++		case kUnlockEncryptedVolume:
++		{
++			// EncryptedVolume asks for the passphrase and mounts the volume
++			const char* path;
++			if (message->FindString("path", &path) == B_OK) {
++				const char* argv[] = { path, NULL };
++				be_roster->Launch("application/x-vnd.Haiku-EncryptedVolume",
++					1, argv);
++			}
++			break;
++		}
++
+ 		case kRunAutomounterSettings:
+ 			ShowSettingsWindow();
+ 			fSettingsWindow->ShowPage(
+diff --git a/src/libs/luks2/luks2_partitions.cpp b/src/libs/luks2/luks2_partitions.cpp
+new file mode 100644
+index 0000000000..570a55a498
+--- /dev/null
++++ b/src/libs/luks2/luks2_partitions.cpp
+@@ -0,0 +1,171 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Recognising LUKS2 partitions and talking to the luks_disk driver, for
++	userland programs. No crypto here: Tracker and DriveSetup use it. */
++
++
++#include <luks2/luks2_userland.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++
++
++// local copies, so that this file needs nothing else of the LUKS2 code
++static bool
++has_luks2_signature(const uint8_t* header)
++{
++	static const uint8_t kMagic[] = { 'L', 'U', 'K', 'S', 0xba, 0xbe, 0, 2 };
++	return memcmp(header, kMagic, sizeof(kMagic)) == 0;
++}
++
++
++static void
++copy_header_string(char* target, size_t targetSize, const uint8_t* source,
++	size_t sourceSize)
++{
++	if (target == NULL || targetSize == 0)
++		return;
++	size_t length = strnlen((const char*)source, sourceSize);
++	if (length >= targetSize)
++		length = targetSize - 1;
++	memcpy(target, source, length);
++	target[length] = '\0';
++}
++
++
++extern "C" bool
++luks2_partition_label(const char* path, char* label, size_t labelSize,
++	char* uuid, size_t uuidSize)
++{
++	int fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return false;
++	uint8_t header[512];
++	ssize_t bytesRead = pread(fd, header, sizeof(header), 0);
++	close(fd);
++	if (bytesRead != (ssize_t)sizeof(header)
++		|| !has_luks2_signature(header)) {
++		return false;
++	}
++
++	// binary header: label at 24 (48 bytes), UUID at 168 (40 bytes)
++	copy_header_string(label, labelSize, header + 24, 48);
++	copy_header_string(uuid, uuidSize, header + 168, 40);
++	return true;
++}
++
++
++#ifdef __HAIKU__
++
++
++static void
++wipe(void* buffer, size_t size)
++{
++	memset(buffer, 0, size);
++	__asm__ __volatile__("" : : "r"(buffer) : "memory");
++}
++
++
++static int
++open_control_device()
++{
++	return open("/dev/" LUKS2_CONTROL_DEVICE_NAME, O_RDONLY);
++}
++
++
++extern "C" status_t
++luks2_find_open_device(const char* path, luks2_device_info* info)
++{
++	char resolved[PATH_MAX];
++	if (realpath(path, resolved) == NULL)
++		strlcpy(resolved, path, sizeof(resolved));
++
++	int control = open_control_device();
++	if (control < 0)
++		return errno;
++
++	status_t status = B_ENTRY_NOT_FOUND;
++	int32 id = 0;
++	while (true) {
++		memset(info, 0, sizeof(*info));
++		info->version = LUKS2_DRIVER_INTERFACE_VERSION;
++		info->id = id;
++		if (ioctl(control, LUKS2_IOCTL_GET_INFO, info, sizeof(*info)) != 0)
++			break;
++		if (strcmp(info->path, resolved) == 0) {
++			status = B_OK;
++			break;
++		}
++		id = info->id + 1;
++	}
++	close(control);
++	return status;
++}
++
++
++extern "C" status_t
++luks2_open_device(const char* path, const uint8_t* key, size_t keySize,
++	bool readOnly, char* device, size_t deviceSize, int32* _id)
++{
++	luks2_open_request* request
++		= (luks2_open_request*)calloc(1, sizeof(luks2_open_request));
++	if (request == NULL)
++		return B_NO_MEMORY;
++	if (keySize > sizeof(request->key)) {
++		free(request);
++		return B_BAD_VALUE;
++	}
++
++	request->version = LUKS2_DRIVER_INTERFACE_VERSION;
++	request->flags = readOnly ? LUKS2_OPEN_READ_ONLY : 0;
++	memcpy(request->key, key, keySize);
++	request->key_size = keySize;
++	if (realpath(path, request->path) == NULL)
++		strlcpy(request->path, path, sizeof(request->path));
++
++	status_t status;
++	int control = open_control_device();
++	if (control < 0)
++		status = errno;
++	else {
++		status = ioctl(control, LUKS2_IOCTL_OPEN, request, sizeof(*request))
++			== 0 ? B_OK : errno;
++		close(control);
++	}
++
++	if (status == B_OK) {
++		if (device != NULL)
++			strlcpy(device, request->device, deviceSize);
++		if (_id != NULL)
++			*_id = request->id;
++	}
++	wipe(request, sizeof(*request));
++	free(request);
++	return status;
++}
++
++
++extern "C" status_t
++luks2_close_device(int32 id)
++{
++	int control = open_control_device();
++	if (control < 0)
++		return errno;
++	luks2_close_request request = { LUKS2_DRIVER_INTERFACE_VERSION, id };
++	status_t status = ioctl(control, LUKS2_IOCTL_CLOSE, &request,
++		sizeof(request)) == 0 ? B_OK : errno;
++	close(control);
++	return status;
++}
++
++
++#endif	// __HAIKU__
+diff --git a/src/libs/luks2/luks2_userland.cpp b/src/libs/luks2/luks2_userland.cpp
+new file mode 100644
+index 0000000000..f00b778805
+--- /dev/null
++++ b/src/libs/luks2/luks2_userland.cpp
+@@ -0,0 +1,167 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	Random numbers and KDF parameters for userland programs that create
++	volumes and keyslots (the luks command, EncryptedVolume). */
++
++
++#include <luks2/luks2_userland.h>
++
++#include <errno.h>
++#include <fcntl.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#ifdef __HAIKU__
++#	include <OS.h>
++#else
++#	include <sys/random.h>
++#endif
++
++
++extern "C" int
++luks2_random(void* buffer, size_t size)
++{
++	uint8_t* bytes = (uint8_t*)buffer;
++#ifdef __HAIKU__
++	int fd = open("/dev/urandom", O_RDONLY);
++	if (fd < 0)
++		return -1;
++	while (size > 0) {
++		ssize_t bytesRead = read(fd, bytes, size);
++		if (bytesRead < 0 && errno == EINTR)
++			continue;
++		if (bytesRead <= 0) {
++			close(fd);
++			return -1;
++		}
++		bytes += bytesRead;
++		size -= bytesRead;
++	}
++	close(fd);
++#else
++	while (size > 0) {
++		ssize_t bytesRead = getrandom(bytes, size, 0);
++		if (bytesRead < 0) {
++			if (errno == EINTR)
++				continue;
++			return -1;
++		}
++		bytes += bytesRead;
++		size -= bytesRead;
++	}
++#endif
++	return 0;
++}
++
++
++static double
++now()
++{
++	struct timespec time;
++	clock_gettime(CLOCK_MONOTONIC, &time);
++	return time.tv_sec + time.tv_nsec / 1e9;
++}
++
++
++static uint64_t
++physical_memory_kib()
++{
++#ifdef __HAIKU__
++	system_info info;
++	if (get_system_info(&info) == B_OK)
++		return (uint64_t)info.max_pages * B_PAGE_SIZE / 1024;
++#else
++	long pages = sysconf(_SC_PHYS_PAGES);
++	long pageSize = sysconf(_SC_PAGESIZE);
++	if (pages > 0 && pageSize > 0)
++		return (uint64_t)pages * pageSize / 1024;
++#endif
++	return 512 * 1024;
++}
++
++
++extern "C" void
++luks2_choose_kdf(luks2_kdf* kdf, int type, uint32_t iterTimeMs,
++	uint32_t memoryKiB, uint32_t lanes, uint32_t passes, uint32_t iterations)
++{
++	memset(kdf, 0, sizeof(*kdf));
++	kdf->type = type;
++	double target = (iterTimeMs != 0 ? iterTimeMs : 2000) / 1000.0;
++	const char* salt = "benchmark salt..";
++
++	if (type == LUKS2_KDF_PBKDF2) {
++		kdf->hash = LUKS2_HASH_SHA256;
++		kdf->iterations = iterations;
++		if (kdf->iterations == 0) {
++			uint8_t out[64];
++			uint32_t count = 1000;
++			double elapsed;
++			while (true) {
++				double start = now();
++				luks2_pbkdf2(LUKS2_HASH_SHA256, "passphrase", 10, salt, 16,
++					count, out, 64);
++				elapsed = now() - start;
++				if (elapsed > 0.1 || count > (1u << 30))
++					break;
++				count *= 4;
++			}
++			// 64 bytes of output are two PBKDF2 blocks
++			double rate = count * 2 / elapsed;
++			kdf->iterations = (uint32_t)(rate * target / 2);
++			if (kdf->iterations < 1000)
++				kdf->iterations = 1000;
++		}
++		return;
++	}
++
++	kdf->cpus = lanes != 0 ? lanes : 4;
++	kdf->memory = memoryKiB;
++	if (kdf->memory == 0) {
++		uint64_t memory = physical_memory_kib() / 4;
++		if (memory > 1024 * 1024)
++			memory = 1024 * 1024;
++		kdf->memory = (uint32_t)memory;
++	}
++	if (kdf->memory < 8 * kdf->cpus)
++		kdf->memory = 8 * kdf->cpus;
++	kdf->time = passes;
++
++	if (kdf->time == 0) {
++		// one pass over a sample, then scale
++		uint32_t sample = kdf->memory < 64 * 1024 ? kdf->memory : 64 * 1024;
++		uint8_t out[64];
++		double start = now();
++		luks2_argon2(type == LUKS2_KDF_ARGON2I ? LUKS2_ARGON2I : LUKS2_ARGON2ID,
++			1, sample, kdf->cpus, "passphrase", 10, salt, 16, NULL, 0, NULL, 0,
++			out, 64);
++		double perKiB = (now() - start) / sample;
++		double passTime = perKiB * kdf->memory;
++		kdf->time = (uint32_t)(target / passTime);
++		if (kdf->time < 4) {
++			// at least four passes, as cryptsetup; less memory instead
++			kdf->time = 4;
++			uint64_t memory = (uint64_t)(target / 4 / perKiB);
++			if (memory < kdf->memory) {
++				kdf->memory = memory < 32 * 1024 ? 32 * 1024
++					: (uint32_t)memory;
++			}
++		}
++	}
++}
++
++
++extern "C" uint32_t
++luks2_choose_digest_iterations(void)
++{
++	uint8_t out[32];
++	double start = now();
++	luks2_pbkdf2(LUKS2_HASH_SHA256, "key", 3, "salt", 4, 100000, out, 32);
++	double rate = 100000 / (now() - start);
++	uint32_t iterations = (uint32_t)(rate / 8);
++	return iterations < 1000 ? 1000 : iterations;
++}
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index 52602aae3f..0c9e389ce3 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -46,6 +46,18 @@ software emulation (`-cpu max` emulates AES-NI).
+   "Unlock encrypted volume" item; the RAM after boots 1 and 2 must hold no
+   copy of the volume key; the host reads back what Haiku wrote.
+ 
++- `qemu/run-ui-test.sh`: the Haiku side, on the desktop, driven over ssh
++  (a test key; sshd started at boot by a launch job) with `hey`
++  (`qemu/guest-ui-test.sh`): EncryptedVolume encrypts a blank disk (LUKS2 +
++  BFS, mounted); unmounting through mount_server, as Tracker does, locks it
++  (eject); Tracker's unlock message starts EncryptedVolume, a wrong and
++  then the right passphrase mount it again with the files intact;
++  `EncryptedVolume --lock` (DriveSetup's Lock); a partition of a GPT disk
++  encrypted, Installer installs onto it and puts its EFI loader on the
++  disk's ESP; then that disk boots on its own and asks for the passphrase.
++  Needs `qemu/locale-settings` (en_US; or `LOCALE_SETTINGS`) so
++  the first boot doesn't stop at the language prompt.
++
+ ## arm64
+ 
+ `arm64_compile_check.sh <generated.arm64> <out dir>` compiles every LUKS2
+diff --git a/src/tests/system/luks2/arm64_compile_check.sh b/src/tests/system/luks2/arm64_compile_check.sh
+index 3cf56869ad..4973a647ef 100755
+--- a/src/tests/system/luks2/arm64_compile_check.sh
++++ b/src/tests/system/luks2/arm64_compile_check.sh
+@@ -26,7 +26,7 @@ common="-Wall -Wno-multichar -Wpointer-arith -Wsign-compare -Werror
+ 	-DHAIKU_DISTRO_COMPATIBILITY_DEFAULT -DHAIKU_TARGET_PLATFORM_HAIKU
+ 	-DHAIKU_REGULAR_BUILD"
+ os=""
+-for d in "" add-ons add-ons/file_system add-ons/graphics app device drivers \
++for d in "" add-ons add-ons/file_system add-ons/graphics app device drivers locale \
+ 		interface kernel storage support; do
+ 	os="$os -I$R/headers/os/$d"
+ done
+@@ -97,6 +97,10 @@ for f in $library; do
+ 	compile user "$user" "$f"
+ done
+ compile user "$user" "$L/luks2_write.cpp"
++compile user "$user" "$L/luks2_userland.cpp"
++compile user "$user" "$L/luks2_partitions.cpp"
++compile user "$user -I$R/headers/private/shared -I$R/headers/private/storage" \
++	"$R/src/apps/encryptedvolume/EncryptedVolume.cpp"
+ compile user "$user" "$R/src/bin/luks/luks.cpp"
+ compile kernel "$kernel -I$R/src/system/kernel/device_manager" \
+ 	"$R/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp"
+diff --git a/src/tests/system/luks2/build_host.sh b/src/tests/system/luks2/build_host.sh
+index e167a55317..d074ffa9e5 100755
+--- a/src/tests/system/luks2/build_host.sh
++++ b/src/tests/system/luks2/build_host.sh
+@@ -16,7 +16,7 @@ mkdir -p "$B"
+ CF="$* -Wall -Wextra -Wno-missing-field-initializers -I$R/headers/private"
+ gcc $CF -c "$S/crypto/aes_ct.c" -o "$B/aes_ct.o"
+ for f in crypto/aes_xts crypto/sha2_hmac crypto/argon2 arch/x86/aes_ni json \
+-		luks2_util luks2_read luks2_write; do
++		luks2_util luks2_read luks2_write luks2_userland luks2_partitions; do
+ 	g++ $CF -c "$S/$f.cpp" -o "$B/$(basename $f).o"
+ done
+ g++ $CF "$R/src/tests/system/luks2/crypto_test.cpp" "$B/aes_ct.o" \
+diff --git a/src/tests/system/luks2/qemu/guest-driver-test.sh b/src/tests/system/luks2/qemu/guest-driver-test.sh
+index e97d863263..5172f3e6ef 100755
+--- a/src/tests/system/luks2/qemu/guest-driver-test.sh
++++ b/src/tests/system/luks2/qemu/guest-driver-test.sh
+@@ -23,6 +23,15 @@ run() {
+ 	return $status
+ }
+ 
++# the directory at / where the device is mounted
++mount_point_of() {
++	for d in /*; do
++		[ -d "$d" ] || continue
++		df "$d" 2>/dev/null | grep -q "Device: $1\$" && { echo "$d"; return 0; }
++	done
++	return 1
++}
++
+ log "start: $(uname -srvm)"
+ sleep 10
+ 
+@@ -119,10 +128,27 @@ run luks close "$dev" && ok "close after unmount" || bad "close after unmount"
+ 
+ dev=$(luks open -k $T/key-blank "$BLANK" 2>&1) && ok "reopen: $dev" \
+ 	|| bad "reopen: $dev"
+-sleep 2
+-run df
+-mkdir -p /LuksTest2
+-run mount -t bfs "$dev" /LuksTest2 && ok "mount" || bad "mount"
++# the device is removable: mount_server mounts the volume on it by itself
++mp=""
++for i in $(seq 1 20); do
++	mp=$(mount_point_of "$dev") && break
++	sleep 1
++done
++if [ -n "$mp" ]; then
++	ok "mount_server mounted it at $mp"
++else
++	bad "not mounted by mount_server"
++	mkdir -p /LuksTest2
++	run mount -t bfs "$dev" /LuksTest2
++	mp=/LuksTest2
++fi
++run df "$mp"
++if [ "$mp" != /LuksTest2 ]; then
++	# the rest of the test uses /LuksTest2
++	run unmount "$mp"
++	mkdir -p /LuksTest2
++	run mount -t bfs "$dev" /LuksTest2 && ok "mount" || bad "mount"
++fi
+ if (cd /LuksTest2/data && run sha256sum -c /LuksTest2/sums.txt); then
+ 	ok "all files read back identical after closing and reopening"
+ else
+@@ -143,7 +169,10 @@ else
+ 	ok "writing to the read-only device fails"
+ fi
+ run luks list
+-run luks close "$dev"
++sleep 3
++mp=$(mount_point_of "$dev") && run unmount "$mp"
++run luks close "$dev" && ok "close the read-only volume" \
++	|| bad "close read-only"
+ 
+ log "== 5. keyslots on Haiku"
+ run luks addkey -k $T/key-blank --new-key-file $T/key-second --pbkdf pbkdf2 \
+diff --git a/src/tests/system/luks2/qemu/guest-ui-test.sh b/src/tests/system/luks2/qemu/guest-ui-test.sh
+new file mode 100755
+index 0000000000..95bdaaee29
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/guest-ui-test.sh
+@@ -0,0 +1,163 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# The guest half of run-ui-test.sh, run over ssh on the desktop: drives
++# EncryptedVolume, mount_server, Tracker and Installer with hey.
++#  1. EncryptedVolume --encrypt on a blank disk: LUKS2 + BFS, mounted
++#  2. files on it; unmounted through mount_server (as Tracker does): locked
++#  3. Tracker's "Unlock" message: EncryptedVolume, a wrong passphrase, the
++#     right one: mounted again, the files intact
++#  4. EncryptedVolume --lock (DriveSetup's Lock)
++#  5. partition 2 of a GPT disk encrypted, Installer installs onto it, and
++#     installs the EFI loader onto the disk's ESP
++# Usage: guest-ui-test.sh <test files dir>
++
++T=$1
++passed=0
++failed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++bad() { failed=$((failed + 1)); echo "FAIL $*"; }
++result() { sed -n 's/^ *"'"$1"'" ([A-Z_0-9]*) : //p' | sed 's/^"\(.*\)"$/\1/'; }
++wait_window() {
++	# wait_window <app> <title part>
++	for i in $(seq 1 30); do
++		hey "$1" get Title of Window 0 2>/dev/null | grep -q "$2" && return 0
++		sleep 1
++	done
++	return 1
++}
++
++bootDisk=$(df /boot | sed -n 's/^ *Device: *\/dev\/disk\/nvme\/\([0-9]*\)\/.*/\1/p')
++for d in /dev/disk/nvme/*; do
++	n=$(basename "$d")
++	[ "$n" = "$bootDisk" ] && continue
++	if [ "$(head -c 14 "$d/raw")" = "LUKSTEST-BLANK" ]; then
++		BLANK=$d/raw
++	elif [ -e "$d/1" ]; then
++		TARGET=$d
++	fi
++done
++echo "boot disk $bootDisk, blank $BLANK, target $TARGET"
++
++echo "== 1. encrypt a blank disk with EncryptedVolume"
++EncryptedVolume --encrypt "$BLANK" > /tmp/ev.log 2>&1 &
++wait_window EncryptedVolume Encrypt || bad "no Encrypt window"
++name=$(hey EncryptedVolume get Value of View name of Window 0 | result result)
++[ "$name" = "Encrypted" ] && ok "a whole disk gets the default name" \
++	|| bad "default name \"$name\""
++hey EncryptedVolume set Value of View name of Window 0 to '"Secret"' > /dev/null
++hey EncryptedVolume set Value of View passphrase of Window 0 to '"first passphrase"' > /dev/null
++hey EncryptedVolume set Value of View repeat of Window 0 to '"not the same"' > /dev/null
++[ "$(hey EncryptedVolume get Enabled of View ok of Window 0 | result result)" = FALSE ] \
++	&& ok "Encrypt is disabled while the passphrases differ" \
++	|| bad "Encrypt enabled with different passphrases"
++hey EncryptedVolume set Value of View repeat of Window 0 to '"first passphrase"' > /dev/null
++screenshot -s -f png /boot/home/ui-encrypt.png
++reply=$(hey EncryptedVolume encr of Window 0)
++[ "$(echo "$reply" | result result)" = "0 (0x00000000)" ] \
++	&& ok "encrypted and mounted at $(echo "$reply" | result 'mount point')" \
++	|| bad "encrypt: $reply"
++cp /boot/system/lib/libbe.so /Secret/
++echo "secret note" > /Secret/note.txt
++sync
++sum=$(sha256sum /Secret/libbe.so | cut -d' ' -f1)
++
++echo "== 2. unmounted through mount_server: locked"
++dev=$(df /Secret | sed -n 's/^ *Device No.: *//p')
++hey application/x-vnd.Haiku-mount_server umnt with device_id="int32($dev)" > /dev/null
++sleep 3
++[ ! -d /Secret ] && ok "unmounted" || bad "/Secret still there"
++luks list | grep -q "No open" && ok "the unmount locked it (eject)" \
++	|| bad "still open: $(luks list)"
++
++echo "== 3. Tracker's Unlock message, a wrong passphrase, the right one"
++hey Tracker Tulk with path="\"$BLANK\"" > /dev/null
++wait_window EncryptedVolume Unlock && ok "Tracker started EncryptedVolume" \
++	|| bad "no Unlock window"
++hey EncryptedVolume set Value of View passphrase of Window 0 to '"wrong"' > /dev/null
++reply=$(hey EncryptedVolume unlk of Window 0)
++echo "$reply" | grep -q "doesn't open" && ok "the wrong passphrase is refused" \
++	|| bad "wrong passphrase: $reply"
++screenshot -s -f png /boot/home/ui-wrong.png
++hey EncryptedVolume set Value of View passphrase of Window 0 to '"first passphrase"' > /dev/null
++reply=$(hey EncryptedVolume unlk of Window 0)
++[ "$(echo "$reply" | result result)" = "0 (0x00000000)" ] \
++	&& ok "unlocked and mounted at $(echo "$reply" | result 'mount point')" \
++	|| bad "unlock: $reply"
++[ "$(sha256sum /Secret/libbe.so | cut -d' ' -f1)" = "$sum" ] \
++	&& [ "$(cat /Secret/note.txt)" = "secret note" ] \
++	&& ok "the files are intact" || bad "files differ"
++
++echo "== 4. EncryptedVolume --lock (DriveSetup's Lock)"
++EncryptedVolume --lock "$BLANK" && luks list | grep -q "No open" \
++	&& [ ! -d /Secret ] && ok "locked" || bad "lock: $(luks list)"
++
++echo "== 5. Installer onto an encrypted partition, EFI loader onto the ESP"
++EncryptedVolume --encrypt "$TARGET/1" > /tmp/ev2.log 2>&1 &
++wait_window EncryptedVolume Encrypt || bad "no Encrypt window"
++hey EncryptedVolume set Value of View name of Window 0 to '"HaikuLUKS"' > /dev/null
++hey EncryptedVolume set Value of View passphrase of Window 0 to "\"$(cat $T/key-installed)\"" > /dev/null
++hey EncryptedVolume set Value of View repeat of Window 0 to "\"$(cat $T/key-installed)\"" > /dev/null
++reply=$(hey EncryptedVolume encr of Window 0)
++[ "$(echo "$reply" | result result)" = "0 (0x00000000)" ] \
++	&& ok "partition 2 encrypted, BFS mounted at /HaikuLUKS" \
++	|| bad "encrypt the target: $reply"
++
++Installer > /tmp/installer.log 2>&1 &
++wait_window Installer README || bad "no README window"
++hey Installer next > /dev/null
++hey Installer agre > /dev/null
++sleep 6
++S="Menu 0 of View 0 of View srcMenuField of Window 0"
++M="Menu 0 of View 0 of View destMenuField of Window 0"
++target=-1
++count=$(hey Installer count MenuItem of $M | result result | cut -d' ' -f1)
++for i in $(seq 0 $((count - 1))); do
++	label=$(hey Installer get Label of MenuItem $i of $M | result result)
++	echo "   target $i: $label"
++	case "$label" in
++		HaikuLUKS*luks*) target=$i ;;
++	esac
++done
++[ $target -ge 0 ] && ok "Installer offers the unlocked volume as a target" \
++	|| bad "no HaikuLUKS target"
++hey Installer set Mark of MenuItem 0 of $S to "bool(true)" > /dev/null
++hey Installer set Mark of MenuItem $target of $M to "bool(true)" > /dev/null
++hey Installer iSPT of Window 0 > /dev/null
++hey Installer iTPT of Window 0 > /dev/null
++sleep 2
++screenshot -s -f png /boot/home/ui-installer.png
++hey Installer iBGN of Window 0 > /dev/null
++for i in $(seq 1 900); do
++	label=$(hey Installer get Label of View begin_button of Window 0 | result result)
++	[ "$label" != "Stop" ] && break
++	sleep 2
++done
++[ "$label" = "Quit" ] && [ -d /HaikuLUKS/system/packages ] \
++	&& ok "Installer finished: $(ls /HaikuLUKS/system/packages | wc -l) packages" \
++	|| bad "Installer: button \"$label\""
++
++E="Menu 2 of Menu 0 of MenuBar of Window 0"
++hey Installer get Label of MenuItem 0 of $E | result result
++hey Installer do MenuItem 0 of $E > /dev/null
++sleep 4
++screenshot -s -f png /boot/home/ui-efi.png
++hey Installer ALTB of Window 0 with which="int32(0)" > /dev/null
++ok "Install EFI loader invoked (the host checks the ESP)"
++md5sum /boot/system/data/platform_loaders/haiku_loader.efi | cut -d' ' -f1 \
++	> /tmp/loader.md5
++
++# the installed system runs the boot checks and lets us in at its first boot
++S=/HaikuLUKS/system/settings
++mkdir -p $S/luks-test $S/launch $S/network /HaikuLUKS/home/config/settings
++cp $T/ssh-setup.sh $T/authorized_keys $T/test.sh $S/luks-test/
++cp $T/ssh.job $S/launch/luks-test-ssh
++cp $T/test.job $S/launch/luks-test
++cp $T/hostname $S/network/hostname
++cp "$T/Locale settings" "/HaikuLUKS/home/config/settings/Locale settings"
++luks dump "$TARGET/1" | sed -n 's/^  UUID: *//p' > $S/luks-test/uuid
++sync
++hey Installer quit > /dev/null 2>&1
++
++echo "done: $passed passed, $failed failed"
+diff --git a/src/tests/system/luks2/qemu/locale-settings b/src/tests/system/luks2/qemu/locale-settings
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd27ad26d24e6f50b6381c05215b6c057ade00c2
+GIT binary patch
+literal 394
+zcmaKo(Q3jl6o&t<bJK0$jqG}_py&%ID_$sy?JjmTianNMn?RBZKENKqTVGYr2`VUV
+z2fmQ}|4IHN<7w0dSHK+ps6BhnOoMr19vP|go&axHB=JbrFWvz{@4tFo`a8@!^KeHW
+zuqM$V+W1VqhjNaPFp?SK1C!b8qGzm0e}L8{SMK+F(nB<_`gbRNsnv#*E3~ry9i)D~
+zVq~eKNSi8kKJ<2QMfIOuTk7@4x;CRyFV_ICV`mDL+sNo@ZfHfuP&P?bUZ*($<#{GQ
+ML<*~-B)hc;juES1lmGw#
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/tests/system/luks2/qemu/run-ui-test.sh b/src/tests/system/luks2/qemu/run-ui-test.sh
+new file mode 100755
+index 0000000000..ec86359b94
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/run-ui-test.sh
+@@ -0,0 +1,177 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Tests the Haiku side of encrypted volumes in QEMU (x86_64, UEFI, NVMe):
++# EncryptedVolume, Tracker's unlock message, mount_server's eject (lock),
++# Installer onto an encrypted partition with its EFI loader, then a boot of
++# that freshly installed encrypted disk on its own.
++# The guest is driven over ssh (a test key; sshd set up at boot by a launch
++# job), with hey; see guest-ui-test.sh.
++#
++# Usage: run-ui-test.sh <anyboot image> <work dir> <bfs_shell> [timeout s]
++
++set -e
++IMAGE=$1
++W=$2
++BFS=$3
++TIMEOUT=${4:-1800}
++HERE=$(cd "$(dirname "$0")" && pwd)
++# Locale settings (skip the first-boot language prompt): en_US
++LOCALE=${LOCALE_SETTINGS:-$HERE/locale-settings}
++mkdir -p "$W"
++cd "$W"
++
++passed=0
++failed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++bad() { failed=$((failed + 1)); echo "FAIL $*"; }
++
++echo "== disks"
++cp "$IMAGE" boot.img
++rm -f blank.img target.img esp.img
++truncate -s 256M blank.img
++printf 'LUKSTEST-BLANK' | dd of=blank.img conv=notrunc 2>/dev/null
++truncate -s 1400M target.img
++sgdisk -n 1:2048:+64M -t 1:ef00 -c 1:"EFI system" -n 2:0:0 -t 2:8309 \
++	-c 2:"Haiku (encrypted)" target.img > /dev/null
++truncate -s 64M esp.img
++mformat -i esp.img -F -v EFI ::
++dd if=esp.img of=target.img bs=512 seek=2048 conv=notrunc 2>/dev/null
++rm esp.img
++
++echo "== ssh access for the test, and the guest's files"
++mkdir -p files
++rm -f vmkey vmkey.pub
++ssh-keygen -q -t ed25519 -N "" -C luks-test -f vmkey
++cp vmkey.pub files/authorized_keys
++printf 'installed system passphrase' > files/key-installed
++echo luks-vm > files/hostname
++cp "$LOCALE" "files/Locale settings"
++cp "$HERE/guest-boot-test.sh" files/test.sh
++cp "$HERE/guest-ui-test.sh" files/guest-ui-test.sh
++cat > files/ssh-setup.sh <<'EOF'
++#!/bin/sh
++# test VMs only: sshd for the test key
++S=/boot/system/settings/ssh
++mkdir -p $S /boot/system/var/empty /boot/system/var/run
++# the openssh package's first-boot script creates the sshd user
++for i in $(seq 1 120); do
++	grep -q "^sshd:" /boot/system/settings/etc/passwd 2>/dev/null && break
++	sleep 1
++done
++cat > $S/sshd_config <<CONFIG
++PermitRootLogin yes
++PasswordAuthentication no
++StrictModes no
++AuthorizedKeysFile /boot/system/settings/luks-test/authorized_keys
++Subsystem sftp /boot/system/lib/openssh/sftp-server
++CONFIG
++[ -e $S/ssh_host_ed25519_key ] || /boot/system/bin/ssh-keygen -A > /dev/dprintf 2>&1
++/boot/system/bin/sshd -f $S/sshd_config > /dev/dprintf 2>&1 \
++	&& echo "LUKSTEST sshd started" > /dev/dprintf
++EOF
++printf 'job x-vnd.luks-test-ssh {\n\tlaunch /bin/sh /boot/system/settings/luks-test/ssh-setup.sh\n}\n' \
++	> files/ssh.job
++printf 'job x-vnd.luks-test {\n\tlaunch /bin/sh /boot/system/settings/luks-test/test.sh\n}\n' \
++	> files/test.job
++offset=$(sfdisk -d boot.img | sed -n 's/.*1 : start= *\([0-9]*\),.*/\1/p')
++printf '%s\n' "mkdir -p /myfs/system/settings/luks-test" \
++	"mkdir -p /myfs/system/settings/launch" \
++	"mkdir -p /myfs/system/settings/network" \
++	"mkdir -p /myfs/home/config/settings" \
++	"cp :$W/files/ssh-setup.sh /myfs/system/settings/luks-test/ssh-setup.sh" \
++	"cp :$W/files/authorized_keys /myfs/system/settings/luks-test/authorized_keys" \
++	"cp :$W/files/ssh.job /myfs/system/settings/launch/luks-test-ssh" \
++	"cp :$W/files/hostname /myfs/system/settings/network/hostname" \
++	"cp \":$W/files/Locale settings\" \"/myfs/home/config/settings/Locale settings\"" \
++	"sync" "quit" | "$BFS" --start-offset $((offset * 512)) boot.img \
++	> bfs_shell.log 2>&1 || true
++
++vm() {
++	ssh -q -i "$W/vmkey" -p 2222 -o StrictHostKeyChecking=no \
++		-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 user@127.0.0.1 "$@"
++}
++
++echo "== the live system: EncryptedVolume, Tracker, mount_server, Installer"
++cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
++rm -f serial.log mon.sock
++timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 3072 \
++	-accel tcg,thread=multi \
++	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
++	-drive if=pflash,format=raw,file=vars.fd \
++	-drive if=none,id=boot,file=boot.img,format=raw \
++	-device nvme,drive=boot,serial=boot \
++	-drive if=none,id=d1,file=blank.img,format=raw \
++	-device nvme,drive=d1,serial=blank \
++	-drive if=none,id=d2,file=target.img,format=raw \
++	-device nvme,drive=d2,serial=target \
++	-device e1000,netdev=n0 \
++	-netdev user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22 \
++	-display none -serial file:serial.log -monitor unix:mon.sock,server,nowait \
++	-no-reboot > qemu.log 2>&1 &
++qemu=$!
++for i in $(seq 1 120); do
++	grep -aq "LUKSTEST sshd started" serial.log 2>/dev/null && break
++	sleep 3
++done
++sleep 10
++if scp -q -i vmkey -P 2222 -o StrictHostKeyChecking=no \
++		-o UserKnownHostsFile=/dev/null -r files user@127.0.0.1:/tmp/luks-test; then
++	vm "sh /tmp/luks-test/guest-ui-test.sh /tmp/luks-test" > guest-ui.log 2>&1 \
++		|| true
++else
++	echo "no ssh into the guest" > guest-ui.log
++	kill $qemu 2>/dev/null || true
++fi
++sed 's/^/guest: /' guest-ui.log
++mkdir -p shots
++scp -q -i vmkey -P 2222 -o StrictHostKeyChecking=no \
++	-o UserKnownHostsFile=/dev/null "user@127.0.0.1:/boot/home/ui-*.png" \
++	shots/ 2>/dev/null || true
++loaderMD5=$(vm "cat /tmp/loader.md5" 2>/dev/null || true)
++vm "sync; shutdown -q" > /dev/null 2>&1 || true
++wait $qemu || true
++
++if grep -q "^done: [0-9]* passed, 0 failed" guest-ui.log; then
++	ok "the live system's checks passed"
++else
++	bad "the live system's checks"
++fi
++rm -f esp-loader.efi
++mcopy -o -i target.img@@1M ::/EFI/BOOT/BOOTX64.EFI esp-loader.efi 2>/dev/null \
++	|| true
++if [ -n "$loaderMD5" ] \
++		&& [ "$(md5sum esp-loader.efi | cut -d' ' -f1)" = "$loaderMD5" ]; then
++	ok "Installer put the system's EFI loader on the ESP"
++else
++	bad "no EFI loader on the ESP"
++fi
++
++echo "== booting the installed encrypted disk on its own"
++cp /usr/share/OVMF/OVMF_VARS_4M.fd vars2.fd
++rm -f s2.sock m2.sock
++timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 2048 \
++	-accel tcg,thread=multi \
++	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
++	-drive if=pflash,format=raw,file=vars2.fd \
++	-drive if=none,id=disk,file=target.img,format=raw \
++	-device nvme,drive=disk,serial=installed \
++	-nic none -display none -no-reboot \
++	-chardev socket,id=ser0,path=s2.sock,server=on,wait=on \
++	-serial chardev:ser0 -monitor unix:m2.sock,server,nowait \
++	> qemu-installed.log 2>&1 &
++qemu=$!
++python3 -I "$HERE/boot_console.py" s2.sock m2.sock serial-installed.log \
++	files/key-installed --timeout "$TIMEOUT" || true
++wait $qemu || true
++grep -a "LUKSTEST" serial-installed.log | sed 's/^.*LUKSTEST /installed: /' \
++	| grep -v "installed:    |"
++if grep -aq "LUKSTEST done: [0-9]* passed, 0 failed" serial-installed.log; then
++	ok "the installed encrypted system booted with one passphrase prompt"
++else
++	bad "the installed system's boot"
++fi
++
++echo "$passed passed, $failed failed"
++[ $failed -eq 0 ]

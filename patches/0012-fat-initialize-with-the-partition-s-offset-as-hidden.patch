@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Thu, 12 Nov 2026 00:29:28 -0500
+Subject: [PATCH 12/15] fat: initialize with the partition's offset as hidden
+ sectors
+
+The BPB's hidden sectors field counts the sectors before the volume on
+its disk. mkdos wrote the partition's size there (in 512-byte units), in
+both the FAT32 and the FAT12/16 boot sector; the ESP of an encrypted
+install in a VM (sector 40, 262144 sectors) said 262144. It is now the
+partition's offset in the volume's sectors, or 0 when unknown or past the
+32-bit field. The driver itself doesn't use the field; boot code and other
+systems' tools may. The value goes to the syslog with the other
+initialization details.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/add-ons/kernel/file_systems/fat/mkdos.cpp | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/src/add-ons/kernel/file_systems/fat/mkdos.cpp b/src/add-ons/kernel/file_systems/fat/mkdos.cpp
+index 8b7986efb5..1231a189f5 100644
+--- a/src/add-ons/kernel/file_systems/fat/mkdos.cpp
++++ b/src/add-ons/kernel/file_systems/fat/mkdos.cpp
+@@ -398,6 +398,16 @@ _dosfs_initialize(int fd, partition_id partitionID, const char* name, const char
+ 		dprintf("%c ", fatLabel[i]);
+ 	dprintf("]\n");
+ 
++	// The BPB's hidden sectors: how many sectors precede the volume on its
++	// disk, i.e. the partition's offset (it used to get the partition's
++	// size). 0 when that isn't known, or doesn't fit the 32-bit field.
++	uint32 hiddenSectors = 0;
++	if (hasPartitionInfo
++		&& uint64(partitionInfo.offset) / sectorSize <= 0xffffffff) {
++		hiddenSectors = uint64(partitionInfo.offset) / sectorSize;
++	}
++	dprintf("dosfs: hidden sectors: %" B_PRIu32 "\n", hiddenSectors);
++
+ 	if (status < B_OK) {
+ 		dprintf("dosfs: Initializing volume failed: %s\n", strerror(status));
+ 		return status;
+@@ -411,7 +421,6 @@ _dosfs_initialize(int fd, partition_id partitionID, const char* name, const char
+ 	if (fatbits == 32) {
+ 		bootsector32 *bs = (bootsector32 *)bootsector;
+ 		uint16 temp16;
+-		uint32 temp32;
+ 		memcpy(bs->BS_OEMName,"Haiku   ",8);
+ 		bs->BPB_BytsPerSec = B_HOST_TO_LENDIAN_INT16(sectorSize);
+ 		bs->BPB_SecPerClus = sectorPerCluster;
+@@ -425,8 +434,7 @@ _dosfs_initialize(int fd, partition_id partitionID, const char* name, const char
+ 		bs->BPB_SecPerTrk = B_HOST_TO_LENDIAN_INT16(temp16);
+ 		temp16 = hasBiosGeometry ? biosGeometry.head_count : 255;
+ 		bs->BPB_NumHeads = B_HOST_TO_LENDIAN_INT16(temp16);
+-		temp32 = hasPartitionInfo ? (partitionInfo.size / 512) : 0;
+-		bs->BPB_HiddSec = B_HOST_TO_LENDIAN_INT32(temp32);
++		bs->BPB_HiddSec = B_HOST_TO_LENDIAN_INT32(hiddenSectors);
+ 		bs->BPB_TotSec32 = B_HOST_TO_LENDIAN_INT32(sectorCount);
+ 		bs->BPB_FATSz32 = B_HOST_TO_LENDIAN_INT32(FATSize);
+ 		bs->BPB_ExtFlags = B_HOST_TO_LENDIAN_INT16(0);
+@@ -462,8 +470,7 @@ _dosfs_initialize(int fd, partition_id partitionID, const char* name, const char
+ 		bs->BPB_SecPerTrk = B_HOST_TO_LENDIAN_INT16(temp16);
+ 		temp16 = hasBiosGeometry ? biosGeometry.head_count : 255;
+ 		bs->BPB_NumHeads = B_HOST_TO_LENDIAN_INT16(temp16);
+-		temp32 = hasPartitionInfo ? (partitionInfo.size / 512) : 0;
+-		bs->BPB_HiddSec = B_HOST_TO_LENDIAN_INT32(temp32);
++		bs->BPB_HiddSec = B_HOST_TO_LENDIAN_INT32(hiddenSectors);
+ 		temp32 = (sectorCount <= 65535) ? 0 : sectorCount;
+ 		bs->BPB_TotSec32 = B_HOST_TO_LENDIAN_INT32(temp32);
+ 		bs->BS_DrvNum = biosDriveId;

@@ -1,0 +1,1644 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 00:38:41 -0500
+Subject: [PATCH 02/15] luks_disk: a driver for decrypted LUKS2 devices
+
+drivers/disk/virtual/luks_disk publishes each LUKS2 volume opened with
+its volume key as /dev/disk/virtual/luks/<id>/raw, which the disk device
+manager scans and file systems mount like any disk. It is opened and closed
+through ioctls on /dev/disk/virtual/luks/control (the luks command runs the
+KDF in userland), or at boot through its boot module. Every key is checked
+against the header's digest; closing is refused while a file system on it
+is mounted, and the key is wiped when the last descriptor is closed.
+
+Reads and writes go through a fixed pool of bounce buffers per device, so
+writing back pages never needs an allocation; partial sectors are
+read-modified-written under a lock; flushes are passed down, discards are
+not. The driver is in the haiku package and its boot module set.
+
+Tested in QEMU (x86_64, UEFI, NVMe): src/tests/system/luks2/qemu/
+run-driver-test.sh, 30 checks in Haiku and 5 on the build host against
+cryptsetup's volumes and keys.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/jam/packages/Haiku                      |    2 +
+ .../kernel/drivers/disk/virtual/Jamfile       |    1 +
+ .../drivers/disk/virtual/luks_disk/Jamfile    |   29 +
+ .../disk/virtual/luks_disk/luks_disk.cpp      | 1197 +++++++++++++++++
+ .../system/luks2/qemu/guest-driver-test.sh    |  170 +++
+ .../system/luks2/qemu/run-driver-test.sh      |  157 +++
+ 6 files changed, 1556 insertions(+)
+ create mode 100644 src/add-ons/kernel/drivers/disk/virtual/luks_disk/Jamfile
+ create mode 100644 src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+ create mode 100755 src/tests/system/luks2/qemu/guest-driver-test.sh
+ create mode 100755 src/tests/system/luks2/qemu/run-driver-test.sh
+
+diff --git a/build/jam/packages/Haiku b/build/jam/packages/Haiku
+index 3b2a756c48..f9c7ae3d98 100644
+--- a/build/jam/packages/Haiku
++++ b/build/jam/packages/Haiku
+@@ -136,6 +136,7 @@ AddNewDriversToPackage disk scsi :
+ 	scsi_disk
+ 	;
+ AddNewDriversToPackage disk virtual :
++	luks_disk
+ 	ram_disk
+ 	virtio_block@arm,arm64,riscv64
+ 	;
+@@ -339,6 +340,7 @@ AddBootModuleSymlinksToPackage
+ 	intel
+ 	it8211
+ 	legacy_sata
++	luks_disk
+ 	mmc
+ 	mmc_disk
+ 	nvme_disk
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/Jamfile b/src/add-ons/kernel/drivers/disk/virtual/Jamfile
+index 8c4d0f063f..472c8d8d9c 100644
+--- a/src/add-ons/kernel/drivers/disk/virtual/Jamfile
++++ b/src/add-ons/kernel/drivers/disk/virtual/Jamfile
+@@ -1,5 +1,6 @@
+ SubDir HAIKU_TOP src add-ons kernel drivers disk virtual ;
+ 
++SubInclude HAIKU_TOP src add-ons kernel drivers disk virtual luks_disk ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers disk virtual nbd ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers disk virtual ram_disk ;
+ SubInclude HAIKU_TOP src add-ons kernel drivers disk virtual remote_disk ;
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/Jamfile b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/Jamfile
+new file mode 100644
+index 0000000000..0e1b6207fa
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/Jamfile
+@@ -0,0 +1,29 @@
++SubDir HAIKU_TOP src add-ons kernel drivers disk virtual luks_disk ;
++
++UsePrivateKernelHeaders ;
++SubDirSysHdrs $(HAIKU_TOP) headers private ;
++
++# the LUKS2 code shared with the boot loader and the luks tool
++local luks2Dir = [ FDirName $(HAIKU_TOP) src libs luks2 ] ;
++SEARCH_SOURCE += $(luks2Dir) ;
++SEARCH_SOURCE += [ FDirName $(luks2Dir) crypto ] ;
++SEARCH_SOURCE += [ FDirName $(luks2Dir) arch x86 ] ;
++
++local accelerators ;
++if $(TARGET_ARCH) = x86_64 {
++	accelerators = aes_ni.cpp ;
++}
++
++KernelAddon luks_disk :
++	luks_disk.cpp
++
++	json.cpp
++	luks2_read.cpp
++	luks2_util.cpp
++
++	aes_ct.c
++	aes_xts.cpp
++	argon2.cpp
++	sha2_hmac.cpp
++	$(accelerators)
++;
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+new file mode 100644
+index 0000000000..6e0d4272e1
+--- /dev/null
++++ b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+@@ -0,0 +1,1197 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	The luks_disk driver: unlocks LUKS2 volumes with a volume key and
++	publishes each as a decrypted disk device,
++	/dev/disk/virtual/luks/<id>/raw, which the disk device manager scans and
++	file systems mount like any disk.
++
++	Devices are opened through ioctls on /dev/disk/virtual/luks/control (the
++	luks command line tool runs the KDF in userland and passes the volume
++	key), or at boot through the "boot" module with the key the boot loader
++	passed (see vfs_boot.cpp). Every key is checked against the volume's
++	LUKS2 digest before it's used.
++
++	Reads and writes go through a small fixed pool of bounce buffers per
++	device, so the page writer never needs an allocation to write back.
++	The underlying device is kept open in the kernel's I/O context.
++*/
++
++
++#include <errno.h>
++#include <fcntl.h>
++#include <new>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <Drivers.h>
++#include <KernelExport.h>
++#include <device_manager.h>
++
++#include <fs/devfs.h>
++#include <fs/KPath.h>
++#include <fs_info.h>
++#include <kernel.h>
++#include <lock.h>
++#include <syscalls.h>
++#include <util/AutoLock.h>
++
++#include <luks2/luks2.h>
++#include <luks2/luks2_driver.h>
++
++
++//#define TRACE_LUKS
++#ifdef TRACE_LUKS
++#	define TRACE(x...) dprintf("luks: " x)
++#else
++#	define TRACE(x...) do {} while (false)
++#endif
++#define ERROR(x...) dprintf("luks: " x)
++
++
++static const char* const kDriverModuleName
++	= "drivers/disk/virtual/luks_disk/driver_v1";
++static const char* const kControlDeviceModuleName
++	= "drivers/disk/virtual/luks_disk/control/device_v1";
++static const char* const kRawDeviceModuleName
++	= "drivers/disk/virtual/luks_disk/raw/device_v1";
++static const char* const kVolumeIDItem = "luks/id";
++
++static const size_t kBufferSize = 64 * 1024;
++static const int32 kBufferCount = 4;
++
++
++static device_manager_info* sDeviceManager;
++
++
++struct BounceBuffer {
++	BounceBuffer*	next;
++	uint8*			data;
++};
++
++
++class Volume {
++public:
++								Volume(int32 id);
++								~Volume();
++
++			status_t			Init(const char* path, const uint8* key,
++									size_t keySize, uint32 flags);
++
++			int32				ID() const { return fID; }
++			const char*			Path() const { return fPath; }
++			const char*			DeviceName() const { return fDeviceName; }
++			off_t				Size() const { return fSize; }
++			bool				IsReadOnly() const { return fReadOnly; }
++
++			device_node*		Node() const { return fNode; }
++			void				SetNode(device_node* node) { fNode = node; }
++
++			bool				IsClosing() const { return fClosing; }
++			void				SetClosing(bool closing)
++									{ fClosing = closing; }
++
++			void				Opened() { atomic_add(&fOpenCount, 1); }
++			void				Closed() { atomic_add(&fOpenCount, -1); }
++
++			status_t			Read(off_t position, void* buffer,
++									size_t* _length);
++			status_t			Write(off_t position, const void* buffer,
++									size_t* _length);
++			status_t			Flush();
++			status_t			Control(uint32 op, void* buffer,
++									size_t length);
++			void				GetInfo(luks2_device_info& info);
++
++private:
++			BounceBuffer*		_AcquireBuffer();
++			void				_ReleaseBuffer(BounceBuffer* buffer);
++			status_t			_ReadSectors(uint64 offset, uint8* data,
++									size_t length);
++			status_t			_WriteSectors(uint64 offset, uint8* data,
++									size_t length);
++
++private:
++			int32				fID;
++			char				fPath[PATH_MAX];
++			char				fDeviceName[64];
++			char				fUUID[LUKS2_UUID_SIZE];
++			char				fLabel[LUKS2_LABEL_SIZE];
++			int					fFD;
++			luks2_xts			fCipher;
++			uint64				fDataOffset;
++			off_t				fSize;
++			uint32				fSectorSize;
++			uint64				fIVTweak;
++			uint32				fKeyBits;
++			bool				fReadOnly;
++			bool				fClosing;
++			int32				fOpenCount;
++			device_node*		fNode;
++
++			rw_lock				fLock;
++				// read-locked for whole-sector I/O, write-locked when a
++				// write has to read-modify-write a partial sector
++			mutex				fBufferLock;
++			sem_id				fBufferSemaphore;
++			BounceBuffer*		fFreeBuffers;
++			BounceBuffer		fBuffers[kBufferCount];
++};
++
++
++static mutex sVolumesLock = MUTEX_INITIALIZER("luks volumes");
++static Volume* sVolumes[LUKS2_MAX_DEVICES];
++static device_node* sControlNode;
++
++
++// #pragma mark - LUKS2 I/O on the underlying device
++
++
++static ssize_t
++header_read(void* cookie, uint64_t offset, void* buffer, size_t size)
++{
++	ssize_t bytesRead = read_pos(*(int*)cookie, offset, buffer, size);
++	return bytesRead < 0 ? (ssize_t)errno : bytesRead;
++}
++
++
++static status_t
++luks2_to_status(int error)
++{
++	switch (error) {
++		case LUKS2_OK:
++			return B_OK;
++		case LUKS2_ERROR_IO:
++			return B_IO_ERROR;
++		case LUKS2_ERROR_NOT_LUKS2:
++		case LUKS2_ERROR_CORRUPT:
++			return B_BAD_DATA;
++		case LUKS2_ERROR_UNSUPPORTED:
++			return B_NOT_SUPPORTED;
++		case LUKS2_ERROR_NO_MEMORY:
++		case LUKS2_ERROR_KDF_MEMORY:
++			return B_NO_MEMORY;
++		case LUKS2_ERROR_BAD_PASSPHRASE:
++		case LUKS2_ERROR_BAD_KEY:
++			return B_PERMISSION_DENIED;
++		case LUKS2_ERROR_READ_ONLY:
++			return B_READ_ONLY_DEVICE;
++	}
++	return B_ERROR;
++}
++
++
++// #pragma mark - Volume
++
++
++Volume::Volume(int32 id)
++	:
++	fID(id),
++	fFD(-1),
++	fDataOffset(0),
++	fSize(0),
++	fSectorSize(512),
++	fIVTweak(0),
++	fKeyBits(0),
++	fReadOnly(false),
++	fClosing(false),
++	fOpenCount(0),
++	fNode(NULL),
++	fBufferSemaphore(-1),
++	fFreeBuffers(NULL)
++{
++	fPath[0] = '\0';
++	fUUID[0] = '\0';
++	fLabel[0] = '\0';
++	snprintf(fDeviceName, sizeof(fDeviceName), "%s/%" B_PRId32 "/raw",
++		LUKS2_RAW_DEVICE_BASE_NAME, id);
++	memset(&fCipher, 0, sizeof(fCipher));
++	memset(fBuffers, 0, sizeof(fBuffers));
++	rw_lock_init(&fLock, "luks volume");
++	mutex_init(&fBufferLock, "luks buffers");
++}
++
++
++Volume::~Volume()
++{
++	luks2_xts_clear(&fCipher);
++	for (int32 i = 0; i < kBufferCount; i++) {
++		if (fBuffers[i].data != NULL) {
++			luks2_wipe(fBuffers[i].data, kBufferSize);
++			free(fBuffers[i].data);
++		}
++	}
++	if (fBufferSemaphore >= 0)
++		delete_sem(fBufferSemaphore);
++	if (fFD >= 0)
++		close(fFD);
++	rw_lock_destroy(&fLock);
++	mutex_destroy(&fBufferLock);
++}
++
++
++status_t
++Volume::Init(const char* path, const uint8* key, size_t keySize,
++	uint32 flags)
++{
++	fReadOnly = (flags & LUKS2_OPEN_READ_ONLY) != 0;
++	strlcpy(fPath, path, sizeof(fPath));
++
++	fFD = open(path, fReadOnly ? O_RDONLY : O_RDWR);
++	if (fFD < 0) {
++		ERROR("can't open %s: %s\n", path, strerror(errno));
++		return errno;
++	}
++
++	struct stat st;
++	if (fstat(fFD, &st) != 0)
++		return errno;
++	uint64 deviceSize;
++	if (S_ISREG(st.st_mode))
++		deviceSize = st.st_size;
++	else {
++		device_geometry geometry;
++		if (ioctl(fFD, B_GET_GEOMETRY, &geometry, sizeof(geometry)) != 0)
++			return errno;
++		deviceSize = (uint64)geometry.bytes_per_sector
++			* geometry.sectors_per_track * geometry.cylinder_count
++			* geometry.head_count;
++		if (geometry.read_only && !fReadOnly) {
++			ERROR("%s is read-only\n", path);
++			return B_READ_ONLY_DEVICE;
++		}
++	}
++
++	luks2_device_io io = { &fFD, header_read, NULL, deviceSize };
++	luks2_volume* volume;
++	int result = luks2_read_header(&io, &volume);
++	if (result != LUKS2_OK) {
++		ERROR("%s: %s\n", path, luks2_error_string(result));
++		return luks2_to_status(result);
++	}
++
++	result = luks2_check_key(volume, key, keySize);
++	if (result == LUKS2_OK)
++		result = luks2_setup_cipher(volume, key, keySize, &fCipher);
++	if (result != LUKS2_OK) {
++		ERROR("%s: %s\n", path, luks2_error_string(result));
++		luks2_free_volume(volume);
++		return luks2_to_status(result);
++	}
++
++	fDataOffset = volume->segment.offset;
++	fSize = volume->segment.size;
++	fSectorSize = volume->segment.sector_size;
++	fIVTweak = volume->segment.iv_tweak;
++	fKeyBits = keySize * 8;
++	strlcpy(fUUID, volume->uuid, sizeof(fUUID));
++	strlcpy(fLabel, volume->label, sizeof(fLabel));
++	luks2_free_volume(volume);
++
++	if (fSize < fSectorSize)
++		return B_BAD_DATA;
++
++	for (int32 i = 0; i < kBufferCount; i++) {
++		fBuffers[i].data = (uint8*)malloc(kBufferSize);
++		if (fBuffers[i].data == NULL)
++			return B_NO_MEMORY;
++		fBuffers[i].next = fFreeBuffers;
++		fFreeBuffers = &fBuffers[i];
++	}
++	fBufferSemaphore = create_sem(kBufferCount, "luks bounce buffers");
++	if (fBufferSemaphore < 0)
++		return fBufferSemaphore;
++
++	dprintf("luks: %s opened as /dev/%s: %" B_PRIdOFF " bytes, sector size %"
++		B_PRIu32 ", AES-%" B_PRIu32 "-XTS (%s)%s\n", path, fDeviceName, fSize,
++		fSectorSize, fKeyBits / 2,
++		luks2_aes_implementation_name(fCipher.data.implementation),
++		fReadOnly ? ", read-only" : "");
++	return B_OK;
++}
++
++
++BounceBuffer*
++Volume::_AcquireBuffer()
++{
++	while (acquire_sem(fBufferSemaphore) == B_INTERRUPTED)
++		;
++	MutexLocker locker(fBufferLock);
++	BounceBuffer* buffer = fFreeBuffers;
++	fFreeBuffers = buffer->next;
++	return buffer;
++}
++
++
++void
++Volume::_ReleaseBuffer(BounceBuffer* buffer)
++{
++	MutexLocker locker(fBufferLock);
++	buffer->next = fFreeBuffers;
++	fFreeBuffers = buffer;
++	locker.Unlock();
++	release_sem(fBufferSemaphore);
++}
++
++
++/*!	Reads and decrypts whole sectors; \a offset is relative to the data
++	segment. */
++status_t
++Volume::_ReadSectors(uint64 offset, uint8* data, size_t length)
++{
++	ssize_t bytesRead = read_pos(fFD, fDataOffset + offset, data, length);
++	if (bytesRead < 0)
++		return errno;
++	if ((size_t)bytesRead != length)
++		return B_IO_ERROR;
++
++	for (size_t i = 0; i < length; i += fSectorSize) {
++		luks2_xts_decrypt(&fCipher, (offset + i) / LUKS2_IV_SECTOR_SIZE
++			+ fIVTweak, data + i, fSectorSize);
++	}
++	return B_OK;
++}
++
++
++/*!	Encrypts (in place) and writes whole sectors. */
++status_t
++Volume::_WriteSectors(uint64 offset, uint8* data, size_t length)
++{
++	for (size_t i = 0; i < length; i += fSectorSize) {
++		luks2_xts_encrypt(&fCipher, (offset + i) / LUKS2_IV_SECTOR_SIZE
++			+ fIVTweak, data + i, fSectorSize);
++	}
++
++	ssize_t bytesWritten = write_pos(fFD, fDataOffset + offset, data, length);
++	if (bytesWritten < 0)
++		return errno;
++	if ((size_t)bytesWritten != length)
++		return B_IO_ERROR;
++	return B_OK;
++}
++
++
++static status_t
++copy_to(void* target, const void* source, size_t length)
++{
++	if (IS_USER_ADDRESS(target))
++		return user_memcpy(target, source, length);
++	memcpy(target, source, length);
++	return B_OK;
++}
++
++
++static status_t
++copy_from(void* target, const void* source, size_t length)
++{
++	if (IS_USER_ADDRESS(source))
++		return user_memcpy(target, source, length);
++	memcpy(target, source, length);
++	return B_OK;
++}
++
++
++status_t
++Volume::Read(off_t position, void* buffer, size_t* _length)
++{
++	size_t length = *_length;
++	if (position < 0 || position > fSize)
++		return B_BAD_VALUE;
++	if ((uint64)length > (uint64)(fSize - position))
++		length = fSize - position;
++	*_length = 0;
++	if (length == 0)
++		return B_OK;
++
++	ReadLocker locker(fLock);
++	BounceBuffer* bounce = _AcquireBuffer();
++	status_t status = B_OK;
++	size_t done = 0;
++
++	while (done < length) {
++		uint64 current = position + done;
++		uint64 start = current / fSectorSize * fSectorSize;
++		size_t skip = current - start;
++		size_t chunk = skip + (length - done);
++		chunk = (chunk + fSectorSize - 1) / fSectorSize * fSectorSize;
++		if (chunk > kBufferSize)
++			chunk = kBufferSize;
++
++		status = _ReadSectors(start, bounce->data, chunk);
++		if (status != B_OK)
++			break;
++
++		size_t toCopy = chunk - skip;
++		if (toCopy > length - done)
++			toCopy = length - done;
++		status = copy_to((uint8*)buffer + done, bounce->data + skip, toCopy);
++		if (status != B_OK)
++			break;
++		done += toCopy;
++	}
++
++	_ReleaseBuffer(bounce);
++	*_length = done;
++	return done > 0 ? B_OK : status;
++}
++
++
++status_t
++Volume::Write(off_t position, const void* buffer, size_t* _length)
++{
++	if (fReadOnly)
++		return B_READ_ONLY_DEVICE;
++
++	size_t length = *_length;
++	if (position < 0 || position > fSize)
++		return B_BAD_VALUE;
++	if ((uint64)length > (uint64)(fSize - position))
++		length = fSize - position;
++	*_length = 0;
++	if (length == 0)
++		return B_OK;
++
++	// Partial sectors need a read-modify-write that no other write may
++	// interleave with.
++	bool partial = position % fSectorSize != 0
++		|| (position + length) % fSectorSize != 0;
++	if (partial)
++		rw_lock_write_lock(&fLock);
++	else
++		rw_lock_read_lock(&fLock);
++
++	BounceBuffer* bounce = _AcquireBuffer();
++	status_t status = B_OK;
++	size_t done = 0;
++
++	while (done < length) {
++		uint64 current = position + done;
++		uint64 start = current / fSectorSize * fSectorSize;
++		size_t skip = current - start;
++		size_t chunk = skip + (length - done);
++		chunk = (chunk + fSectorSize - 1) / fSectorSize * fSectorSize;
++		if (chunk > kBufferSize)
++			chunk = kBufferSize;
++		size_t toCopy = chunk - skip;
++		if (toCopy > length - done)
++			toCopy = length - done;
++
++		// the old contents of partially written sectors
++		if (skip != 0) {
++			status = _ReadSectors(start, bounce->data, fSectorSize);
++			if (status != B_OK)
++				break;
++		}
++		size_t end = skip + toCopy;
++		if (end % fSectorSize != 0
++			&& (skip == 0 || end > fSectorSize)) {
++			size_t lastSector = end / fSectorSize * fSectorSize;
++			status = _ReadSectors(start + lastSector,
++				bounce->data + lastSector, fSectorSize);
++			if (status != B_OK)
++				break;
++		}
++
++		status = copy_from(bounce->data + skip, (const uint8*)buffer + done,
++			toCopy);
++		if (status != B_OK)
++			break;
++
++		size_t sectors = (end + fSectorSize - 1) / fSectorSize * fSectorSize;
++		status = _WriteSectors(start, bounce->data, sectors);
++		if (status != B_OK)
++			break;
++		done += toCopy;
++	}
++
++	_ReleaseBuffer(bounce);
++	if (partial)
++		rw_lock_write_unlock(&fLock);
++	else
++		rw_lock_read_unlock(&fLock);
++
++	*_length = done;
++	return done > 0 ? B_OK : status;
++}
++
++
++status_t
++Volume::Flush()
++{
++	if (ioctl(fFD, B_FLUSH_DRIVE_CACHE, NULL, 0) != 0) {
++		// a device without a cache to flush is fine
++		if (errno != B_DEV_INVALID_IOCTL && errno != B_BAD_VALUE
++			&& errno != B_NOT_SUPPORTED) {
++			return errno;
++		}
++	}
++	return B_OK;
++}
++
++
++status_t
++Volume::Control(uint32 op, void* buffer, size_t length)
++{
++	switch (op) {
++		case B_GET_DEVICE_SIZE:
++		{
++			size_t size = fSize;
++			return user_memcpy(buffer, &size, sizeof(size_t));
++		}
++
++		case B_GET_MEDIA_STATUS:
++		{
++			status_t status = B_OK;
++			return user_memcpy(buffer, &status, sizeof(status_t));
++		}
++
++		case B_GET_GEOMETRY:
++		case B_GET_BIOS_GEOMETRY:
++		{
++			if (buffer == NULL || length > sizeof(device_geometry))
++				return B_BAD_VALUE;
++			device_geometry geometry;
++			memset(&geometry, 0, sizeof(geometry));
++			devfs_compute_geometry_size(&geometry, fSize / fSectorSize,
++				fSectorSize);
++			geometry.bytes_per_physical_sector = fSectorSize;
++			geometry.device_type = B_DISK;
++			geometry.removable = false;
++			geometry.read_only = fReadOnly;
++			geometry.write_once = false;
++			return user_memcpy(buffer, &geometry, length);
++		}
++
++		case B_GET_ICON_NAME:
++			return user_strlcpy((char*)buffer, "devices/drive-harddisk",
++				B_FILE_NAME_LENGTH);
++
++		case B_GET_READ_STATUS:
++		case B_GET_WRITE_STATUS:
++		{
++			bool value = true;
++			return user_memcpy(buffer, &value, sizeof(bool));
++		}
++
++		case B_SET_NONBLOCKING_IO:
++		case B_SET_BLOCKING_IO:
++		case B_SET_UNINTERRUPTABLE_IO:
++		case B_SET_INTERRUPTABLE_IO:
++			return B_OK;
++
++		case B_FLUSH_DRIVE_CACHE:
++			return Flush();
++
++		case B_TRIM_DEVICE:
++			// discards would show which blocks are in use
++			return B_NOT_SUPPORTED;
++
++		case LUKS2_IOCTL_GET_DEVICE_INFO:
++		{
++			if (buffer == NULL || !IS_USER_ADDRESS(buffer)
++				|| length < sizeof(luks2_device_info)) {
++				return B_BAD_VALUE;
++			}
++			luks2_device_info info;
++			GetInfo(info);
++			return user_memcpy(buffer, &info, sizeof(info));
++		}
++	}
++
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++void
++Volume::GetInfo(luks2_device_info& info)
++{
++	memset(&info, 0, sizeof(info));
++	info.version = LUKS2_DRIVER_INTERFACE_VERSION;
++	info.id = fID;
++	strlcpy(info.path, fPath, sizeof(info.path));
++	snprintf(info.device, sizeof(info.device), "/dev/%s", fDeviceName);
++	strlcpy(info.uuid, fUUID, sizeof(info.uuid));
++	strlcpy(info.label, fLabel, sizeof(info.label));
++	info.size = fSize;
++	info.sector_size = fSectorSize;
++	info.key_bits = fKeyBits;
++	info.flags = fReadOnly ? LUKS2_OPEN_READ_ONLY : 0;
++	info.open_count = fOpenCount;
++	strlcpy(info.implementation,
++		luks2_aes_implementation_name(fCipher.data.implementation),
++		sizeof(info.implementation));
++}
++
++
++// #pragma mark - opening and closing volumes
++
++
++/*!	Tells whether a file system is mounted from the device or from a
++	partition on it. */
++static bool
++device_is_mounted(const char* deviceName)
++{
++	char prefix[B_PATH_NAME_LENGTH];
++	// "/dev/disk/virtual/luks/<id>/": the raw device and its partitions
++	snprintf(prefix, sizeof(prefix), "/dev/%s", deviceName);
++	char* lastSlash = strrchr(prefix, '/');
++	if (lastSlash != NULL)
++		lastSlash[1] = '\0';
++	size_t prefixLength = strlen(prefix);
++
++	int32 cookie = 0;
++	dev_t device;
++	while ((device = _kern_next_device(&cookie)) >= 0) {
++		fs_info info;
++		if (_kern_read_fs_info(device, &info) == B_OK
++			&& strncmp(info.device_name, prefix, prefixLength) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++/*!	Makes sure the control device's node exists (the device manager creates
++	it when "disk" devices are probed), and returns it. */
++static device_node*
++control_node()
++{
++	if (sControlNode == NULL) {
++		int fd = open("/dev/" LUKS2_CONTROL_DEVICE_NAME, O_RDONLY);
++		if (fd >= 0)
++			close(fd);
++	}
++	return sControlNode;
++}
++
++
++static status_t
++open_volume(const char* rawPath, const uint8* key, size_t keySize,
++	uint32 flags, int32* _id, char* deviceName, size_t deviceNameSize)
++{
++	device_node* controlNode = control_node();
++	if (controlNode == NULL)
++		return B_NO_INIT;
++
++	KPath path;
++	status_t status = path.SetTo(rawPath, KPath::NORMALIZE);
++	if (status != B_OK)
++		return status;
++
++	MutexLocker locker(sVolumesLock);
++
++	int32 id = -1;
++	for (int32 i = 0; i < LUKS2_MAX_DEVICES; i++) {
++		if (sVolumes[i] != NULL) {
++			if (strcmp(sVolumes[i]->Path(), path.Path()) == 0)
++				return B_BUSY;
++			continue;
++		}
++		if (id < 0)
++			id = i;
++	}
++	if (id < 0)
++		return B_BUSY;
++
++	Volume* volume = new(std::nothrow) Volume(id);
++	if (volume == NULL)
++		return B_NO_MEMORY;
++	status = volume->Init(path.Path(), key, keySize, flags);
++	if (status != B_OK) {
++		delete volume;
++		return status;
++	}
++	sVolumes[id] = volume;
++	locker.Unlock();
++
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "LUKS2 encrypted volume" } },
++		{ kVolumeIDItem, B_UINT32_TYPE, { .ui32 = (uint32)id } },
++		{ NULL }
++	};
++	device_node* parent = sDeviceManager->get_parent_node(controlNode);
++	status = sDeviceManager->register_node(parent, kDriverModuleName, attrs,
++		NULL, NULL);
++	sDeviceManager->put_node(parent);
++	if (status != B_OK) {
++		ERROR("registering device %" B_PRId32 " failed: %s\n", id,
++			strerror(status));
++		locker.Lock();
++		if (sVolumes[id] == volume && volume->Node() == NULL) {
++			sVolumes[id] = NULL;
++			delete volume;
++		}
++		return status;
++	}
++
++	*_id = id;
++	snprintf(deviceName, deviceNameSize, "/dev/%s", volume->DeviceName());
++	return B_OK;
++}
++
++
++static status_t
++close_volume(int32 id)
++{
++	if (id < 0 || id >= LUKS2_MAX_DEVICES)
++		return B_BAD_VALUE;
++
++	MutexLocker locker(sVolumesLock);
++	Volume* volume = sVolumes[id];
++	if (volume == NULL)
++		return B_ENTRY_NOT_FOUND;
++	if (volume->IsClosing() || volume->Node() == NULL)
++		return B_BUSY;
++	volume->SetClosing(true);
++	device_node* node = volume->Node();
++	locker.Unlock();
++
++	// (the disk device manager is asked without our lock held)
++	if (device_is_mounted(volume->DeviceName())) {
++		volume->SetClosing(false);
++		return B_BUSY;
++	}
++
++	status_t status = sDeviceManager->unpublish_device(node,
++		volume->DeviceName());
++	if (status != B_OK) {
++		ERROR("unpublishing %s failed: %s\n", volume->DeviceName(),
++			strerror(status));
++		volume->SetClosing(false);
++		return status;
++	}
++
++	// The node goes away when the last open file descriptor is closed; then
++	// the volume is deleted (and its key wiped) in uninit_driver().
++	status = sDeviceManager->unregister_node(node);
++	if (status != B_OK && status != B_BUSY) {
++		ERROR("unregistering %s failed: %s\n", volume->DeviceName(),
++			strerror(status));
++		return status;
++	}
++	return B_OK;
++}
++
++
++// #pragma mark - driver
++
++
++static float
++luks_supports_device(device_node* parent)
++{
++	const char* bus = NULL;
++	if (sDeviceManager->get_attr_string(parent, B_DEVICE_BUS, &bus, false)
++			== B_OK
++		&& strcmp(bus, "generic") == 0) {
++		return 0.8;
++	}
++	return -1;
++}
++
++
++static status_t
++luks_register_device(device_node* parent)
++{
++	device_attr attrs[] = {
++		{ B_DEVICE_PRETTY_NAME, B_STRING_TYPE,
++			{ .string = "LUKS2 Control Device" } },
++		{ NULL }
++	};
++	return sDeviceManager->register_node(parent, kDriverModuleName, attrs,
++		NULL, NULL);
++}
++
++
++struct DriverCookie {
++	device_node*	node;
++	Volume*			volume;		// NULL for the control device
++};
++
++
++static status_t
++luks_init_driver(device_node* node, void** _cookie)
++{
++	DriverCookie* cookie = new(std::nothrow) DriverCookie;
++	if (cookie == NULL)
++		return B_NO_MEMORY;
++	cookie->node = node;
++	cookie->volume = NULL;
++
++	uint32 id;
++	if (sDeviceManager->get_attr_uint32(node, kVolumeIDItem, &id, false)
++			== B_OK) {
++		MutexLocker locker(sVolumesLock);
++		if (id >= LUKS2_MAX_DEVICES || sVolumes[id] == NULL
++			|| sVolumes[id]->Node() != NULL) {
++			delete cookie;
++			return B_ERROR;
++		}
++		cookie->volume = sVolumes[id];
++		cookie->volume->SetNode(node);
++	} else
++		sControlNode = node;
++
++	*_cookie = cookie;
++	return B_OK;
++}
++
++
++static void
++luks_uninit_driver(void* _cookie)
++{
++	DriverCookie* cookie = (DriverCookie*)_cookie;
++	if (cookie->volume != NULL) {
++		MutexLocker locker(sVolumesLock);
++		Volume* volume = cookie->volume;
++		if (sVolumes[volume->ID()] == volume)
++			sVolumes[volume->ID()] = NULL;
++		locker.Unlock();
++		dprintf("luks: /dev/%s closed\n", volume->DeviceName());
++		delete volume;
++	} else if (sControlNode == cookie->node)
++		sControlNode = NULL;
++	delete cookie;
++}
++
++
++static status_t
++luks_register_child_devices(void* _cookie)
++{
++	DriverCookie* cookie = (DriverCookie*)_cookie;
++	if (cookie->volume != NULL) {
++		return sDeviceManager->publish_device(cookie->node,
++			cookie->volume->DeviceName(), kRawDeviceModuleName);
++	}
++	return sDeviceManager->publish_device(cookie->node,
++		LUKS2_CONTROL_DEVICE_NAME, kControlDeviceModuleName);
++}
++
++
++// #pragma mark - control device
++
++
++static status_t
++control_init_device(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = driverCookie;
++	return B_OK;
++}
++
++
++static void
++control_uninit_device(void* deviceCookie)
++{
++}
++
++
++static status_t
++control_open(void* deviceCookie, const char* path, int openMode,
++	void** _cookie)
++{
++	*_cookie = deviceCookie;
++	return B_OK;
++}
++
++
++static status_t
++control_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++control_free(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++control_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++control_write(void* cookie, off_t position, const void* buffer,
++	size_t* _length)
++{
++	return B_NOT_ALLOWED;
++}
++
++
++static status_t
++control_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	// requests only come from userland: kernel buffers are refused
++	if (buffer == NULL || !IS_USER_ADDRESS(buffer))
++		return B_BAD_ADDRESS;
++
++	switch (op) {
++		case LUKS2_IOCTL_OPEN:
++		{
++			luks2_open_request* request = new(std::nothrow) luks2_open_request;
++			if (request == NULL)
++				return B_NO_MEMORY;
++			status_t status = B_OK;
++			if (length < sizeof(*request)
++				|| user_memcpy(request, buffer, sizeof(*request)) != B_OK)
++				status = B_BAD_ADDRESS;
++			else if (request->version != LUKS2_DRIVER_INTERFACE_VERSION
++				|| request->key_size > sizeof(request->key)
++				|| strnlen(request->path, sizeof(request->path))
++					== sizeof(request->path)) {
++				status = B_BAD_VALUE;
++			}
++			if (status == B_OK) {
++				status = open_volume(request->path, request->key,
++					request->key_size, request->flags, &request->id,
++					request->device, sizeof(request->device));
++			}
++			luks2_wipe(request->key, sizeof(request->key));
++			if (status == B_OK) {
++				status = user_memcpy(buffer, request, sizeof(*request));
++				// the caller's copy of the key is the caller's business
++			}
++			delete request;
++			return status;
++		}
++
++		case LUKS2_IOCTL_CLOSE:
++		{
++			luks2_close_request request;
++			if (length < sizeof(request)
++				|| user_memcpy(&request, buffer, sizeof(request)) != B_OK)
++				return B_BAD_ADDRESS;
++			if (request.version != LUKS2_DRIVER_INTERFACE_VERSION)
++				return B_BAD_VALUE;
++			return close_volume(request.id);
++		}
++
++		case LUKS2_IOCTL_GET_INFO:
++		{
++			luks2_device_info* info = new(std::nothrow) luks2_device_info;
++			if (info == NULL)
++				return B_NO_MEMORY;
++			int32 id;
++			status_t status = B_OK;
++			if (length < sizeof(*info)
++				|| user_memcpy(&id, &((luks2_device_info*)buffer)->id,
++					sizeof(id)) != B_OK) {
++				status = B_BAD_ADDRESS;
++			}
++			if (status == B_OK) {
++				status = B_ENTRY_NOT_FOUND;
++				MutexLocker locker(sVolumesLock);
++				for (int32 i = id < 0 ? 0 : id; i < LUKS2_MAX_DEVICES; i++) {
++					if (sVolumes[i] != NULL && !sVolumes[i]->IsClosing()) {
++						sVolumes[i]->GetInfo(*info);
++						status = B_OK;
++						break;
++					}
++				}
++			}
++			if (status == B_OK)
++				status = user_memcpy(buffer, info, sizeof(*info));
++			delete info;
++			return status;
++		}
++	}
++
++	return B_DEV_INVALID_IOCTL;
++}
++
++
++// #pragma mark - raw device
++
++
++static status_t
++raw_init_device(void* driverCookie, void** _deviceCookie)
++{
++	*_deviceCookie = ((DriverCookie*)driverCookie)->volume;
++	return B_OK;
++}
++
++
++static void
++raw_uninit_device(void* deviceCookie)
++{
++}
++
++
++static status_t
++raw_open(void* deviceCookie, const char* path, int openMode, void** _cookie)
++{
++	Volume* volume = (Volume*)deviceCookie;
++	if (volume->IsReadOnly() && (openMode & O_ACCMODE) != O_RDONLY)
++		return B_READ_ONLY_DEVICE;
++	volume->Opened();
++	*_cookie = volume;
++	return B_OK;
++}
++
++
++static status_t
++raw_close(void* cookie)
++{
++	return B_OK;
++}
++
++
++static status_t
++raw_free(void* cookie)
++{
++	((Volume*)cookie)->Closed();
++	return B_OK;
++}
++
++
++static status_t
++raw_read(void* cookie, off_t position, void* buffer, size_t* _length)
++{
++	return ((Volume*)cookie)->Read(position, buffer, _length);
++}
++
++
++static status_t
++raw_write(void* cookie, off_t position, const void* buffer, size_t* _length)
++{
++	return ((Volume*)cookie)->Write(position, buffer, _length);
++}
++
++
++static status_t
++raw_ioctl(void* cookie, uint32 op, void* buffer, size_t length)
++{
++	return ((Volume*)cookie)->Control(op, buffer, length);
++}
++
++
++// #pragma mark - boot module
++
++
++static status_t
++boot_open_volume(const char* path, const uint8* key, size_t keySize,
++	char* device, size_t deviceSize)
++{
++	int32 id;
++	return open_volume(path, key, keySize, 0, &id, device, deviceSize);
++}
++
++
++static status_t
++boot_std_ops(int32 op, ...)
++{
++	switch (op) {
++		case B_MODULE_INIT:
++		case B_MODULE_UNINIT:
++			return B_OK;
++	}
++	return B_ERROR;
++}
++
++
++// #pragma mark -
++
++
++module_dependency module_dependencies[] = {
++	{ B_DEVICE_MANAGER_MODULE_NAME, (module_info**)&sDeviceManager },
++	{}
++};
++
++
++static const struct driver_module_info sDriverModule = {
++	{
++		kDriverModuleName,
++		0,
++		NULL
++	},
++
++	luks_supports_device,
++	luks_register_device,
++	luks_init_driver,
++	luks_uninit_driver,
++	luks_register_child_devices
++};
++
++
++static const struct device_module_info sControlDeviceModule = {
++	{
++		kControlDeviceModuleName,
++		0,
++		NULL
++	},
++
++	control_init_device,
++	control_uninit_device,
++	NULL,
++
++	control_open,
++	control_close,
++	control_free,
++
++	control_read,
++	control_write,
++	NULL,	// io
++
++	control_ioctl,
++
++	NULL,	// select
++	NULL	// deselect
++};
++
++
++static const struct device_module_info sRawDeviceModule = {
++	{
++		kRawDeviceModuleName,
++		0,
++		NULL
++	},
++
++	raw_init_device,
++	raw_uninit_device,
++	NULL,
++
++	raw_open,
++	raw_close,
++	raw_free,
++
++	raw_read,
++	raw_write,
++	NULL,	// io: devfs falls back to read() and write()
++
++	raw_ioctl,
++
++	NULL,	// select
++	NULL	// deselect
++};
++
++
++static luks2_boot_module_info sBootModule = {
++	{
++		LUKS2_BOOT_MODULE_NAME,
++		B_KEEP_LOADED,
++		boot_std_ops
++	},
++
++	boot_open_volume
++};
++
++
++const module_info* modules[] = {
++	(module_info*)&sDriverModule,
++	(module_info*)&sControlDeviceModule,
++	(module_info*)&sRawDeviceModule,
++	(module_info*)&sBootModule,
++	NULL
++};
+diff --git a/src/tests/system/luks2/qemu/guest-driver-test.sh b/src/tests/system/luks2/qemu/guest-driver-test.sh
+new file mode 100755
+index 0000000000..e97d863263
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/guest-driver-test.sh
+@@ -0,0 +1,170 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# The guest half of run-driver-test.sh: runs in Haiku at boot (a launch
++# job), exercises the luks_disk driver and the luks tool on the NVMe test
++# disks, logs every result to the serial port ("LUKSTEST" lines), and powers
++# the machine off.
++
++T=/boot/system/settings/luks-test
++LOG=/boot/home/luks-test.log
++passed=0
++failed=0
++
++log() { echo "LUKSTEST $*" > /dev/dprintf; echo "$*" >> $LOG; }
++ok() { passed=$((passed + 1)); log "ok   $*"; }
++bad() { failed=$((failed + 1)); log "FAIL $*"; }
++# logs a command's output, keeps its exit status
++run() {
++	out=$("$@" 2>&1)
++	status=$?
++	echo "$out" | while read -r line; do log "   | $line"; done
++	return $status
++}
++
++log "start: $(uname -srvm)"
++sleep 10
++
++for raw in /dev/disk/nvme/*/raw; do
++	label=$(luks dump "$raw" 2>/dev/null | sed -n 's/^  label: *//p')
++	case "$label" in
++		csdata) CSDATA=$raw ;;
++		cswrite) CSWRITE=$raw ;;
++	esac
++	if [ "$(head -c 14 "$raw" 2>/dev/null)" = "LUKSTEST-BLANK" ]; then
++		BLANK=$raw
++	fi
++done
++log "disks: csdata=$CSDATA cswrite=$CSWRITE blank=$BLANK"
++[ -n "$CSDATA" ] && [ -n "$CSWRITE" ] && [ -n "$BLANK" ] || bad "test disks"
++
++log "== 1. a volume encrypted by cryptsetup"
++run luks dump "$CSDATA"
++if dev=$(luks open -k $T/key-csdata "$CSDATA" 2>&1); then
++	ok "luks open: $dev"
++else
++	bad "luks open csdata: $dev"
++fi
++run luks list
++sum=$(head -c "$(cat $T/csdata-length)" "$dev" | sha256sum | cut -d' ' -f1)
++if [ "$sum" = "$(cat $T/csdata-sha256)" ]; then
++	ok "the decrypted device has cryptsetup's plaintext ($(cat $T/csdata-length) bytes)"
++else
++	bad "decrypted data differs: $sum"
++fi
++# odd offsets and lengths through the raw device
++dd if="$dev" of=/tmp/odd.bin bs=1 skip=1234567 count=3000 2>/dev/null
++if cmp -s /tmp/odd.bin $T/csdata-odd.bin; then
++	ok "3000 bytes at offset 1234567"
++else
++	bad "unaligned read differs"
++fi
++if run luks open -k $T/key-csdata "$CSDATA"; then
++	bad "opened the same volume twice"
++else
++	ok "a second open of the same volume is refused"
++fi
++run luks close "$dev" && ok "luks close" || bad "luks close"
++if run luks open -k $T/key-wrong "$CSDATA"; then
++	bad "the wrong passphrase opened it"
++else
++	ok "the wrong passphrase is refused"
++fi
++
++log "== 2. writing through the driver onto cryptsetup's volume"
++dev=$(luks open -k $T/key-cswrite "$CSWRITE" 2>&1) && ok "open cswrite: $dev" \
++	|| bad "open cswrite: $dev"
++dd if=$T/pattern.bin of="$dev" bs=65536 conv=notrunc 2>/dev/null \
++	&& ok "1 MiB written" || bad "pattern write"
++# a partial sector: read-modify-write in the driver
++printf 'HELLO' | dd of="$dev" bs=1 seek=1000 conv=notrunc 2>/dev/null \
++	&& ok "5 bytes written at offset 1000" || bad "partial write"
++sync
++run luks close "$dev" || bad "close cswrite"
++
++log "== 3. our own volume with BFS inside"
++run luks format -y -k $T/key-blank -L LuksTest --pbkdf argon2id --memory 16384 \
++	--time 3 --parallel 2 "$BLANK" && ok "luks format" || bad "luks format"
++dev=$(luks open -k $T/key-blank "$BLANK" 2>&1) && ok "open: $dev" \
++	|| bad "open blank: $dev"
++run mkfs -t bfs -q "$dev" LuksTest && ok "mkfs bfs" || bad "mkfs bfs"
++sleep 2
++# mountvolume goes through the disk device manager: it must know the volume
++if run mountvolume LuksTest; then
++	ok "mountvolume found the BFS volume on the decrypted device"
++else
++	bad "mountvolume LuksTest"
++	mkdir -p /LuksTest
++	run mount -t bfs "$dev" /LuksTest
++fi
++run df /LuksTest
++mkdir -p /LuksTest/data
++cp /boot/system/lib/libbe.so /boot/system/lib/libroot.so /LuksTest/data/
++cp $T/random.bin /LuksTest/data/
++echo "written on Haiku through luks_disk" > /LuksTest/data/note.txt
++addattr -t string LUKS:test "an attribute" /LuksTest/data/note.txt
++(cd /LuksTest/data && sha256sum * > /LuksTest/sums.txt)
++run cat /LuksTest/sums.txt
++sync
++if run luks close "$dev"; then
++	bad "closed while mounted"
++else
++	ok "close refused while mounted"
++fi
++run unmount /LuksTest && ok "unmount" || bad "unmount"
++run rmdir /LuksTest
++run luks close "$dev" && ok "close after unmount" || bad "close after unmount"
++[ -e "$dev" ] && bad "$dev still exists" || ok "$dev is gone"
++
++dev=$(luks open -k $T/key-blank "$BLANK" 2>&1) && ok "reopen: $dev" \
++	|| bad "reopen: $dev"
++sleep 2
++run df
++mkdir -p /LuksTest2
++run mount -t bfs "$dev" /LuksTest2 && ok "mount" || bad "mount"
++if (cd /LuksTest2/data && run sha256sum -c /LuksTest2/sums.txt); then
++	ok "all files read back identical after closing and reopening"
++else
++	bad "files differ after reopening"
++fi
++catattr LUKS:test /LuksTest2/data/note.txt 2>&1 | grep -q "an attribute" \
++	&& ok "attribute kept" || bad "attribute"
++run checkfs -c /LuksTest2 && ok "checkfs clean" || bad "checkfs"
++run unmount /LuksTest2 && ok "unmount" || bad "unmount"
++run luks close "$dev" && ok "close" || bad "close"
++
++log "== 4. read-only"
++dev=$(luks open -r -k $T/key-blank "$BLANK" 2>&1) && ok "open read-only: $dev" \
++	|| bad "open read-only: $dev"
++if dd if=/dev/zero of="$dev" bs=512 count=1 conv=notrunc 2>/dev/null; then
++	bad "wrote to a read-only volume"
++else
++	ok "writing to the read-only device fails"
++fi
++run luks list
++run luks close "$dev"
++
++log "== 5. keyslots on Haiku"
++run luks addkey -k $T/key-blank --new-key-file $T/key-second --pbkdf pbkdf2 \
++	--iterations 20000 "$BLANK" && ok "addkey" || bad "addkey"
++run luks test -k $T/key-second "$BLANK" && ok "the new passphrase opens it" \
++	|| bad "new passphrase"
++run luks removekey -k $T/key-blank "$BLANK" && ok "removekey" \
++	|| bad "removekey"
++if run luks test -k $T/key-blank "$BLANK"; then
++	bad "the removed passphrase still opens it"
++else
++	ok "the removed passphrase no longer opens it"
++fi
++run luks dump "$BLANK"
++
++log "== 6. the AES implementation"
++dev=$(luks open -k $T/key-csdata "$CSDATA" 2>&1)
++run luks list
++dd if="$dev" of=/dev/null bs=1048576 2>&1 | while read -r line; do log "   | $line"; done
++run luks close "$dev"
++
++log "done: $passed passed, $failed failed"
++sync
++shutdown -q
+diff --git a/src/tests/system/luks2/qemu/run-driver-test.sh b/src/tests/system/luks2/qemu/run-driver-test.sh
+new file mode 100755
+index 0000000000..b2cfa8c273
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/run-driver-test.sh
+@@ -0,0 +1,157 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Tests the luks_disk driver and the luks tool in QEMU (x86_64, UEFI, NVMe
++# disks) on non-boot volumes, against Linux's cryptsetup:
++#  - csdata: a volume cryptsetup encrypted (offline) with known plaintext;
++#    Haiku must decrypt it byte for byte;
++#  - cswrite: a cryptsetup volume Haiku writes to; cryptsetup's volume key
++#    and OpenSSL must decrypt what Haiku wrote (also a partial sector);
++#  - blank: Haiku formats it, puts BFS on it, writes files, reopens and
++#    checks them; then the build host reads them back through the host luks
++#    tool and bfs_shell, and cryptsetup must open the passphrase Haiku added.
++#
++# Usage: run-driver-test.sh <anyboot image> <work dir> <cryptsetup> <host luks>
++#            <bfs_shell> [timeout seconds]
++
++set -e
++IMAGE=$1
++W=$2
++CS=$3
++LUKS=$4
++BFS=$5
++TIMEOUT=${6:-3600}
++HERE=$(cd "$(dirname "$0")" && pwd)
++mkdir -p "$W"
++cd "$W"
++
++cs() { "$CS" -q --disable-locks "$@"; }
++
++echo "== preparing the disks in $W"
++cp "$IMAGE" boot.img
++printf 'csdata passphrase' > key-csdata
++printf 'cswrite passphrase' > key-cswrite
++printf 'blank volume passphrase' > key-blank
++printf 'a second passphrase, added on Haiku' > key-second
++printf 'not the passphrase' > key-wrong
++head -c $((1024 * 1024)) /dev/urandom > pattern.bin
++head -c $((8 * 1024 * 1024)) /dev/urandom > random.bin
++
++# csdata: 64 MiB of random data encrypted by cryptsetup in place; the first
++# 48 MiB are kept (the rest of the device is reduced away)
++head -c $((64 * 1024 * 1024)) /dev/urandom > csdata.img
++cp csdata.img csdata-plain.img
++cs reencrypt --encrypt --type luks2 --key-file key-csdata --label csdata \
++	--reduce-device-size 16M --sector-size 4096 --pbkdf argon2id \
++	--pbkdf-memory 32768 --pbkdf-force-iterations 4 --pbkdf-parallel 4 \
++	--force-offline-reencrypt csdata.img
++kept=$((48 * 1024 * 1024))
++echo $kept > csdata-length
++head -c $kept csdata-plain.img | sha256sum | cut -d' ' -f1 > csdata-sha256
++dd if=csdata-plain.img of=csdata-odd.bin bs=1 skip=1234567 count=3000 \
++	2>/dev/null
++
++rm -f cswrite.img
++truncate -s 48M cswrite.img
++cs luksFormat --type luks2 --key-file key-cswrite --label cswrite \
++	--sector-size 512 --pbkdf pbkdf2 --pbkdf-force-iterations 50000 \
++	cswrite.img
++
++rm -f blank.img
++truncate -s 256M blank.img
++printf 'LUKSTEST-BLANK' | dd of=blank.img conv=notrunc 2>/dev/null
++
++echo "== putting the guest test into the image"
++cat > luks-test.job <<'JOB'
++job x-vnd.luks-test {
++	launch /bin/sh /boot/system/settings/luks-test/test.sh
++}
++JOB
++cp "$HERE/guest-driver-test.sh" test.sh
++offset=$(sfdisk -d boot.img | sed -n 's/.*1 : start= *\([0-9]*\),.*/\1/p')
++printf '%s\n' \
++	"mkdir -p /myfs/system/settings/luks-test" \
++	"mkdir -p /myfs/system/settings/launch" \
++	"cp :$W/test.sh /myfs/system/settings/luks-test/test.sh" \
++	"cp :$W/key-csdata /myfs/system/settings/luks-test/key-csdata" \
++	"cp :$W/key-cswrite /myfs/system/settings/luks-test/key-cswrite" \
++	"cp :$W/key-blank /myfs/system/settings/luks-test/key-blank" \
++	"cp :$W/key-second /myfs/system/settings/luks-test/key-second" \
++	"cp :$W/key-wrong /myfs/system/settings/luks-test/key-wrong" \
++	"cp :$W/csdata-length /myfs/system/settings/luks-test/csdata-length" \
++	"cp :$W/csdata-sha256 /myfs/system/settings/luks-test/csdata-sha256" \
++	"cp :$W/csdata-odd.bin /myfs/system/settings/luks-test/csdata-odd.bin" \
++	"cp :$W/pattern.bin /myfs/system/settings/luks-test/pattern.bin" \
++	"cp :$W/random.bin /myfs/system/settings/luks-test/random.bin" \
++	"cp :$W/luks-test.job /myfs/system/settings/launch/luks-test" \
++	"sync" "quit" \
++	| "$BFS" --start-offset $((offset * 512)) boot.img > bfs_shell.log 2>&1
++
++echo "== booting QEMU (software emulation, up to $TIMEOUT s)"
++cp /usr/share/OVMF/OVMF_VARS_4M.fd vars.fd
++rm -f serial.log
++start=$(date +%s)
++timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 3072 \
++	-accel tcg,thread=multi \
++	-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
++	-drive if=pflash,format=raw,file=vars.fd \
++	-drive if=none,id=boot,file=boot.img,format=raw \
++	-device nvme,drive=boot,serial=boot \
++	-drive if=none,id=d1,file=csdata.img,format=raw \
++	-device nvme,drive=d1,serial=csdata \
++	-drive if=none,id=d2,file=cswrite.img,format=raw \
++	-device nvme,drive=d2,serial=cswrite \
++	-drive if=none,id=d3,file=blank.img,format=raw \
++	-device nvme,drive=d3,serial=blank \
++	-nic none -display none -serial file:serial.log -no-reboot \
++	> qemu.log 2>&1 || echo "QEMU exited with $?"
++echo "QEMU ran $(( $(date +%s) - start )) s"
++
++grep "LUKSTEST" serial.log | sed 's/^.*LUKSTEST /guest: /' || true
++grep -E "luks: |vfs_boot: |PANIC|panic" serial.log | head -40 || true
++
++echo "== checking on the build host what Haiku wrote"
++passed=0
++failed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++bad() { failed=$((failed + 1)); echo "FAIL $*"; }
++
++key=$(cs luksDump --dump-volume-key --key-file key-cswrite cswrite.img \
++	| sed -n '/MK dump/,$p' | sed 's/MK dump://' | tr -d ' \t\n')
++cp pattern.bin expected.bin
++printf 'HELLO' | dd of=expected.bin bs=1 seek=1000 conv=notrunc 2>/dev/null
++if python3 -I "$HERE/../xts_check.py" cswrite.img 16777216 512 "$key" \
++		expected.bin; then
++	ok "cryptsetup's key and OpenSSL decrypt what Haiku wrote, partial sector included"
++else
++	bad "cswrite data"
++fi
++
++if cs luksOpen --test-passphrase --key-file key-second blank.img; then
++	ok "cryptsetup opens the passphrase Haiku added"
++else
++	bad "cryptsetup and key-second"
++fi
++if cs luksOpen --test-passphrase --key-file key-blank blank.img 2>/dev/null; then
++	bad "cryptsetup still opens the passphrase Haiku removed"
++else
++	ok "cryptsetup refuses the passphrase Haiku removed"
++fi
++rm -f blank-bfs.img
++"$LUKS" read -k key-second blank.img blank-bfs.img
++printf '%s\n' "cp /myfs/data/random.bin :$W/random-back.bin" \
++	"cp /myfs/data/note.txt :$W/note-back.txt" "ls /myfs/data" "quit" \
++	| "$BFS" blank-bfs.img > bfs_shell-read.log 2>&1 || true
++if cmp -s random.bin random-back.bin; then
++	ok "the 8 MiB file Haiku wrote into BFS reads back identical on Linux"
++else
++	bad "random.bin from the BFS volume"
++fi
++grep -q "written on Haiku" note-back.txt 2>/dev/null && ok "note.txt" \
++	|| bad "note.txt"
++
++guestFailed=$(grep -c "LUKSTEST FAIL" serial.log || true)
++grep -q "LUKSTEST done" serial.log || { bad "the guest test didn't finish"; }
++echo "host: $passed passed, $failed failed; guest failures: $guestFailed"
++[ $failed -eq 0 ] && [ "$guestFailed" -eq 0 ]

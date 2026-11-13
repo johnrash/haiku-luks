@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 11:41:58 -0500
+Subject: [PATCH 09/15] luks2 tests: loader_console.py reads the rest of the
+ line it waited for
+
+With --until it stopped reading as soon as the text showed up, so the
+rest of the line (the boot partition's path) could be missing from the
+log and run-loader-disk-test.sh failed a boot that was right.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tests/system/luks2/qemu/loader_console.py | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/tests/system/luks2/qemu/loader_console.py b/src/tests/system/luks2/qemu/loader_console.py
+index ddead9dc12..7160de47e7 100755
+--- a/src/tests/system/luks2/qemu/loader_console.py
++++ b/src/tests/system/luks2/qemu/loader_console.py
+@@ -78,9 +78,10 @@ while time.time() - start < timeout:
+             state = "wait"
+     elif state == "wait" and now > done_at:
+         break
+-    if until is not None and until in seen:
+-        time.sleep(2)
+-        break
++    if until is not None and done_at is None and until in seen:
++        # keep reading a moment: the rest of the line is still coming
++        done_at = now + 2
++        state = "wait"
+ 
+ log.close()
+ print("console: done after %d s" % (time.time() - start), flush=True)

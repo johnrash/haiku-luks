@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 02:46:20 -0500
+Subject: [PATCH 06/15] luks2 tests: stop a VM that doesn't power off by itself
+
+After the console session, the QEMU tests give the guest a minute to
+power off, then stop it, instead of waiting for the whole timeout (a VM
+left at a firmware screen ran on after a failed step).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/tests/system/luks2/qemu/run-boot-test.sh | 13 ++++++++++++-
+ src/tests/system/luks2/qemu/run-ui-test.sh   | 15 +++++++++++++--
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+
+diff --git a/src/tests/system/luks2/qemu/run-boot-test.sh b/src/tests/system/luks2/qemu/run-boot-test.sh
+index a961daf1ce..3cd454a662 100755
+--- a/src/tests/system/luks2/qemu/run-boot-test.sh
++++ b/src/tests/system/luks2/qemu/run-boot-test.sh
+@@ -90,6 +90,17 @@ sgdisk -p disk.img
+ volumeKey=$("$CS" luksDump -q --disable-locks --dump-volume-key --key-file key \
+ 	luks.img | sed -n '/MK dump/,$p' | sed 's/MK dump://' | tr -d ' \t\n')
+ 
++# stop_vm <pid of the timeout wrapper>: give the guest a minute to power
++# off by itself, then stop it
++stop_vm() {
++	for i in $(seq 1 60); do
++		kill -0 "$1" 2>/dev/null || break
++		sleep 1
++	done
++	kill "$1" 2>/dev/null || true
++	wait "$1" 2>/dev/null || true
++}
++
+ boot() {
+ 	# boot <name> <cpu> <console options...>
+ 	name=$1
+@@ -112,7 +123,7 @@ boot() {
+ 	qemu=$!
+ 	python3 -I "$HERE/boot_console.py" serial-$name.sock monitor-$name.sock \
+ 		serial-$name.log "$KEYFILE" "$@" --timeout "$TIMEOUT" || true
+-	wait $qemu || echo "QEMU exited with $?"
++	stop_vm $qemu
+ 	echo "boot $name took $(( $(date +%s) - start )) s"
+ 	grep -a "LUKSTEST" serial-$name.log | sed 's/^.*LUKSTEST /guest: /'
+ 	grep -a -E "luks: |vfs_boot: |PANIC|panic\(" serial-$name.log | head -20
+diff --git a/src/tests/system/luks2/qemu/run-ui-test.sh b/src/tests/system/luks2/qemu/run-ui-test.sh
+index ec86359b94..dcc475a419 100755
+--- a/src/tests/system/luks2/qemu/run-ui-test.sh
++++ b/src/tests/system/luks2/qemu/run-ui-test.sh
+@@ -88,6 +88,17 @@ printf '%s\n' "mkdir -p /myfs/system/settings/luks-test" \
+ 	"sync" "quit" | "$BFS" --start-offset $((offset * 512)) boot.img \
+ 	> bfs_shell.log 2>&1 || true
+ 
++# stop_vm <pid of the timeout wrapper>: give the guest a minute to power
++# off by itself, then stop it
++stop_vm() {
++	for i in $(seq 1 60); do
++		kill -0 "$1" 2>/dev/null || break
++		sleep 1
++	done
++	kill "$1" 2>/dev/null || true
++	wait "$1" 2>/dev/null || true
++}
++
+ vm() {
+ 	ssh -q -i "$W/vmkey" -p 2222 -o StrictHostKeyChecking=no \
+ 		-o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 user@127.0.0.1 "$@"
+@@ -131,7 +142,7 @@ scp -q -i vmkey -P 2222 -o StrictHostKeyChecking=no \
+ 	shots/ 2>/dev/null || true
+ loaderMD5=$(vm "cat /tmp/loader.md5" 2>/dev/null || true)
+ vm "sync; shutdown -q" > /dev/null 2>&1 || true
+-wait $qemu || true
++stop_vm $qemu
+ 
+ if grep -q "^done: [0-9]* passed, 0 failed" guest-ui.log; then
+ 	ok "the live system's checks passed"
+@@ -164,7 +175,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 2048 \
+ qemu=$!
+ python3 -I "$HERE/boot_console.py" s2.sock m2.sock serial-installed.log \
+ 	files/key-installed --timeout "$TIMEOUT" || true
+-wait $qemu || true
++stop_vm $qemu
+ grep -a "LUKSTEST" serial-installed.log | sed 's/^.*LUKSTEST /installed: /' \
+ 	| grep -v "installed:    |"
+ if grep -aq "LUKSTEST done: [0-9]* passed, 0 failed" serial-installed.log; then

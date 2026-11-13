@@ -1,0 +1,2222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 07:31:12 -0500
+Subject: [PATCH 07/15] luks2: fixes from a correctness review: transactions,
+ durability, in-use checks
+
+- Header writes are ordered and flushed: luks2_device_io has a flush hook
+  (luks2_fd_flush(): fsync() for files, B_FLUSH_DRIVE_CACHE for Haiku
+  devices, whose fsync() does nothing). Keyslot material is flushed before
+  the header that points to it, each header copy before the other is
+  touched (a damaged or older copy first), a removed keyslot's area is
+  wiped after the header no longer points to it; errors reach the caller.
+- The library reads both copies again before writing and refuses with
+  LUKS2_ERROR_CHANGED when they changed; the luks command and
+  EncryptedVolume take an exclusive flock() on the device for a change, so
+  a second command is refused instead of racing (two removekeys could both
+  pass the last-key check).
+- The reader tries the other header copy only when the newer one's
+  metadata is damaged, not when it asks for an unsupported feature (the
+  older copy may describe a layout that no longer holds, and the next
+  change wrote it over both); dump names the copy it read.
+- removekey counts only keyslots bound to the data segment; dump marks
+  unbound ones.
+- luks2_partition_in_use() (mounted, has partitions, open as a LUKS2
+  volume): EncryptedVolume checks it when the window opens and again in
+  the worker before formatting; luks format and luks write check it too
+  (O_EXCL for Linux block devices).
+- luks write refuses a file that doesn't fit or isn't whole sectors before
+  writing anything; its final flush is checked.
+- EncryptedVolume refuses passphrases over 512 bytes instead of cutting
+  them; its error alert no longer blocks the application.
+- Boot: the loader finds a volume by its secondary header too
+  (luks2_probe()), and the kernel takes the UUID from the driver's boot
+  module (volume_uuid()), which reads the header like the driver, instead
+  of the primary copy's raw bytes. Tracker and DriveSetup see a volume
+  whose primary magic is damaged.
+
+Tests: crash_test (power lost after every write and flush, every fate of
+the unflushed writes), 21 new cryptsetup checks, new cases in the QEMU
+driver, boot (damaged primary UUID and magic) and GUI tests.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/luks2/luks2.h                 |  34 +-
+ headers/private/luks2/luks2_driver.h          |   5 +
+ headers/private/luks2/luks2_userland.h        |  33 +-
+ .../disk/virtual/luks_disk/luks_disk.cpp      |  75 +++--
+ src/apps/encryptedvolume/EncryptedVolume.cpp  |  81 ++++-
+ src/bin/luks/luks.cpp                         | 125 ++++++--
+ src/libs/luks2/luks2_internal.h               |   5 +
+ src/libs/luks2/luks2_partitions.cpp           | 113 ++++++-
+ src/libs/luks2/luks2_read.cpp                 |  70 ++++-
+ src/libs/luks2/luks2_userland.cpp             |  52 ++++
+ src/libs/luks2/luks2_util.cpp                 |   2 +
+ src/libs/luks2/luks2_write.cpp                |  70 ++++-
+ src/system/boot/loader/luks.cpp               |  18 +-
+ src/system/kernel/fs/vfs_boot.cpp             |  23 +-
+ src/tests/system/luks2/README.md              |  34 +-
+ src/tests/system/luks2/build_host.sh          |   2 +
+ src/tests/system/luks2/craft_header.py        |  17 +-
+ src/tests/system/luks2/crash_test.cpp         | 292 ++++++++++++++++++
+ src/tests/system/luks2/cryptsetup_test.sh     | 141 +++++++++
+ .../system/luks2/qemu/guest-driver-test.sh    |  69 ++++-
+ src/tests/system/luks2/qemu/guest-ui-test.sh  |  60 +++-
+ src/tests/system/luks2/qemu/run-boot-test.sh  |  40 ++-
+ .../system/luks2/qemu/run-driver-test.sh      |  20 +-
+ 23 files changed, 1260 insertions(+), 121 deletions(-)
+ create mode 100644 src/tests/system/luks2/crash_test.cpp
+
+diff --git a/headers/private/luks2/luks2.h b/headers/private/luks2/luks2.h
+index 25afd7fd24..c5490731b2 100644
+--- a/headers/private/luks2/luks2.h
++++ b/headers/private/luks2/luks2.h
+@@ -67,7 +67,9 @@ enum {
+ 	LUKS2_ERROR_BAD_ARGUMENT	= -9,
+ 	LUKS2_ERROR_KDF_MEMORY		= -10,
+ 	LUKS2_ERROR_RANDOM			= -11,
+-	LUKS2_ERROR_READ_ONLY		= -12
++	LUKS2_ERROR_READ_ONLY		= -12,
++	LUKS2_ERROR_CHANGED			= -13
++		// the header on the device changed since it was read
+ };
+ 
+ enum {
+@@ -86,6 +88,9 @@ struct luks2_device_io {
+ 					// NULL for read-only access
+ 	uint64_t	size;
+ 					// of the whole LUKS2 device, in bytes
++	int			(*flush)(void* cookie);
++					// makes the writes so far durable (the drive's cache
++					// too); 0 on success. NULL: nothing to flush
+ };
+ 
+ 
+@@ -146,8 +151,14 @@ struct luks2_volume {
+ 	uint64_t	header_size;	// binary header + JSON area
+ 	uint64_t	sequence_id;
+ 	int			header_hash;
+-	bool		primary_valid;
++	bool		primary_valid;		// checksum and metadata hold up
+ 	bool		secondary_valid;
++	int			active_copy;		// 0 primary, 1 secondary: the one read
++
++	// the state of both copies when they were read, to notice changes by
++	// others before writing
++	bool		copy_checksum_valid[2];
++	uint64_t	copy_sequence_id[2];
+ 
+ 	luks2_json*	json;
+ 	uint64_t	json_size;
+@@ -172,8 +183,16 @@ const char* luks2_error_string(int error);
+ 	version 2. */
+ bool luks2_has_signature(const void* firstSector, size_t length);
+ 
++/*!	Looks for a LUKS2 header: the primary copy's magic at the start, or
++	the secondary's at one of the defined header sizes (a damaged primary).
++	Reads only magic and version. */
++bool luks2_probe(const luks2_device_io* io);
++
+ /*!	Reads both header copies, checks their checksums, picks the newer valid
+-	one, parses and checks the metadata. */
++	one, parses and checks the metadata. The other copy is used only when
++	the newer one's metadata is damaged: when it asks for something this
++	code doesn't support, that's the answer (an older copy may describe a
++	layout that no longer holds). */
+ int luks2_read_header(const luks2_device_io* io, luks2_volume** _volume);
+ void luks2_free_volume(luks2_volume* volume);
+ 
+@@ -233,7 +252,14 @@ struct luks2_format_parameters {
+ 
+ /*!	Writes a new LUKS2 header with keyslot 0 for \a passphrase and a new
+ 	random volume key, which is returned in \a key (may be NULL). Doesn't
+-	touch the data area. */
++	touch the data area.
++
++	All writing functions flush (io->flush) between the steps of a change,
++	so that a crash leaves one valid header copy, old or new: keyslot
++	material before the header that points to it, each header copy before
++	the other one. Callers serialise changes of a volume (the tools lock
++	the device); a header changed by someone else since it was read is
++	refused with LUKS2_ERROR_CHANGED. */
+ int luks2_format(const luks2_device_io* io,
+ 	const luks2_format_parameters* parameters, const void* passphrase,
+ 	size_t passphraseLength, uint8_t* key, size_t* _keySize);
+diff --git a/headers/private/luks2/luks2_driver.h b/headers/private/luks2/luks2_driver.h
+index 270187fe9d..0ef62b9c42 100644
+--- a/headers/private/luks2/luks2_driver.h
++++ b/headers/private/luks2/luks2_driver.h
+@@ -84,6 +84,11 @@ typedef struct luks2_boot_module_info {
+ 		header). The decrypted device's path is returned in \a device. */
+ 	status_t	(*open_volume)(const char* path, const uint8* key,
+ 					size_t keySize, char* device, size_t deviceSize);
++
++	/*!	The UUID of the LUKS2 volume at \a path, read the way the driver
++		reads it (from the secondary header copy when the primary is
++		damaged). */
++	status_t	(*volume_uuid)(const char* path, char* uuid, size_t uuidSize);
+ } luks2_boot_module_info;
+ #endif
+ 
+diff --git a/headers/private/luks2/luks2_userland.h b/headers/private/luks2/luks2_userland.h
+index 430487990f..ec11340672 100644
+--- a/headers/private/luks2/luks2_userland.h
++++ b/headers/private/luks2/luks2_userland.h
+@@ -31,9 +31,10 @@ extern "C" {
+ 
+ // luks2_partitions.cpp
+ 
+-/*!	Tells whether \a path (a partition or disk) starts with a LUKS2 header
+-	and returns its label and UUID (both may be NULL). Reads only the binary
+-	header; it doesn't check the checksum. */
++/*!	Tells whether \a path (a partition or disk) has a LUKS2 header and
++	returns its label and UUID (both may be NULL). Reads only the binary
++	header of the primary copy, or of the secondary when the primary's magic
++	is gone; it doesn't check the checksum. */
+ bool luks2_partition_label(const char* path, char* label, size_t labelSize,
+ 	char* uuid, size_t uuidSize);
+ 
+@@ -50,6 +51,17 @@ status_t luks2_open_device(const char* path, const uint8_t* key,
+ 	int32* _id);
+ 
+ status_t luks2_close_device(int32 id);
++
++enum {
++	LUKS2_NOT_IN_USE = 0,
++	LUKS2_IN_USE_MOUNTED,		// a file system on it is mounted
++	LUKS2_IN_USE_PARTITIONS,	// it has partitions (a disk, say)
++	LUKS2_IN_USE_OPEN			// it's an open (unlocked) LUKS2 volume
++};
++
++/*!	Tells whether overwriting \a path would pull it from under someone: the
++	checks to make right before formatting it or writing its data area. */
++int luks2_partition_in_use(const char* path);
+ #endif
+ 
+ 
+@@ -67,6 +79,21 @@ void luks2_choose_kdf(luks2_kdf* kdf, int type, uint32_t iterTimeMs,
+ /*!	Iterations for the volume key's digest: about 1/8 s here. */
+ uint32_t luks2_choose_digest_iterations(void);
+ 
++/*!	Makes the writes to \a fd durable: fsync() for files, and for devices
++	the drive's cache too (on Haiku, devfs doesn't pass fsync() on, so this
++	asks the driver). A device without a cache to flush is fine. Returns 0
++	or an error code; it fits luks2_device_io::flush with a pointer to the
++	fd as its cookie (luks2_fd_flush_cookie()). */
++int luks2_fd_flush(int fd);
++int luks2_fd_flush_cookie(void* fdPointer);
++
++/*!	Takes an exclusive advisory lock on \a fd without waiting, so that two
++	programs don't change one volume's header at the same time. Returns 0,
++	EWOULDBLOCK when another program holds it, or another error when the
++	file can't be locked (callers go on: the header is also checked for
++	changes before each write). The lock goes with the file's closing. */
++int luks2_lock_fd(int fd);
++
+ 
+ #ifdef __cplusplus
+ }
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+index 137498165d..fdfb75b7ee 100644
+--- a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+@@ -165,6 +165,27 @@ header_read(void* cookie, uint64_t offset, void* buffer, size_t size)
+ }
+ 
+ 
++static status_t
++get_device_size(int fd, uint64* _size, bool* _readOnly)
++{
++	struct stat st;
++	if (fstat(fd, &st) != 0)
++		return errno;
++	*_readOnly = false;
++	if (S_ISREG(st.st_mode)) {
++		*_size = st.st_size;
++		return B_OK;
++	}
++	device_geometry geometry;
++	if (ioctl(fd, B_GET_GEOMETRY, &geometry, sizeof(geometry)) != 0)
++		return errno;
++	*_size = (uint64)geometry.bytes_per_sector * geometry.sectors_per_track
++		* geometry.cylinder_count * geometry.head_count;
++	*_readOnly = geometry.read_only;
++	return B_OK;
++}
++
++
+ static status_t
+ luks2_to_status(int error)
+ {
+@@ -253,26 +274,17 @@ Volume::Init(const char* path, const uint8* key, size_t keySize,
+ 		return errno;
+ 	}
+ 
+-	struct stat st;
+-	if (fstat(fFD, &st) != 0)
+-		return errno;
+ 	uint64 deviceSize;
+-	if (S_ISREG(st.st_mode))
+-		deviceSize = st.st_size;
+-	else {
+-		device_geometry geometry;
+-		if (ioctl(fFD, B_GET_GEOMETRY, &geometry, sizeof(geometry)) != 0)
+-			return errno;
+-		deviceSize = (uint64)geometry.bytes_per_sector
+-			* geometry.sectors_per_track * geometry.cylinder_count
+-			* geometry.head_count;
+-		if (geometry.read_only && !fReadOnly) {
+-			ERROR("%s is read-only\n", path);
+-			return B_READ_ONLY_DEVICE;
+-		}
++	bool readOnlyDevice;
++	status_t status = get_device_size(fFD, &deviceSize, &readOnlyDevice);
++	if (status != B_OK)
++		return status;
++	if (readOnlyDevice && !fReadOnly) {
++		ERROR("%s is read-only\n", path);
++		return B_READ_ONLY_DEVICE;
+ 	}
+ 
+-	luks2_device_io io = { &fFD, header_read, NULL, deviceSize };
++	luks2_device_io io = { &fFD, header_read, NULL, deviceSize, NULL };
+ 	luks2_volume* volume;
+ 	int result = luks2_read_header(&io, &volume);
+ 	if (result != LUKS2_OK) {
+@@ -1115,6 +1127,32 @@ boot_open_volume(const char* path, const uint8* key, size_t keySize,
+ }
+ 
+ 
++/*!	The UUID of the LUKS2 volume at \a path, from the header copy the
++	reader picks: the secondary one when the primary is damaged. */
++static status_t
++boot_volume_uuid(const char* path, char* uuid, size_t uuidSize)
++{
++	int fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return errno;
++	uint64 size;
++	bool readOnly;
++	status_t status = get_device_size(fd, &size, &readOnly);
++	luks2_device_io io = { &fd, header_read, NULL, size, NULL };
++	if (status == B_OK && !luks2_probe(&io))
++		status = B_BAD_TYPE;
++	luks2_volume* volume = NULL;
++	if (status == B_OK)
++		status = luks2_to_status(luks2_read_header(&io, &volume));
++	close(fd);
++	if (status != B_OK)
++		return status;
++	strlcpy(uuid, volume->uuid, uuidSize);
++	luks2_free_volume(volume);
++	return B_OK;
++}
++
++
+ static status_t
+ boot_std_ops(int32 op, ...)
+ {
+@@ -1210,7 +1248,8 @@ static luks2_boot_module_info sBootModule = {
+ 		boot_std_ops
+ 	},
+ 
+-	boot_open_volume
++	boot_open_volume,
++	boot_volume_uuid
+ };
+ 
+ 
+diff --git a/src/apps/encryptedvolume/EncryptedVolume.cpp b/src/apps/encryptedvolume/EncryptedVolume.cpp
+index 27deb815c6..e14840752b 100644
+--- a/src/apps/encryptedvolume/EncryptedVolume.cpp
++++ b/src/apps/encryptedvolume/EncryptedVolume.cpp
+@@ -38,6 +38,7 @@
+ #include <Drivers.h>
+ #include <Entry.h>
+ #include <IconUtils.h>
++#include <Invoker.h>
+ #include <LayoutBuilder.h>
+ #include <Partition.h>
+ #include <Path.h>
+@@ -253,6 +254,23 @@ lock_volume(const char* path)
+ }
+ 
+ 
++/*!	Why \a path can't be encrypted now, or NULL. */
++static const char*
++in_use_message(const char* path)
++{
++	switch (luks2_partition_in_use(path)) {
++		case LUKS2_IN_USE_MOUNTED:
++			return B_TRANSLATE("It's mounted: unmount it first.");
++		case LUKS2_IN_USE_PARTITIONS:
++			return B_TRANSLATE("It has partitions: remove them first.");
++		case LUKS2_IN_USE_OPEN:
++			return B_TRANSLATE("It's an unlocked encrypted volume: lock it "
++				"first.");
++	}
++	return NULL;
++}
++
++
+ // #pragma mark - the work, in its own thread
+ 
+ 
+@@ -324,7 +342,7 @@ unlock(Job& job, BMessage& result)
+ 		result.AddString("error", strerror(errno));
+ 		return errno;
+ 	}
+-	luks2_device_io io = { &fd, fd_read, NULL, fd_size(fd) };
++	luks2_device_io io = { &fd, fd_read, NULL, fd_size(fd), NULL };
+ 	luks2_volume* volume;
+ 	int luks2Result = luks2_read_header(&io, &volume);
+ 	uint8_t key[LUKS2_MAX_KEY_SIZE];
+@@ -372,7 +390,22 @@ encrypt(Job& job, BMessage& result)
+ 		result.AddString("error", strerror(errno));
+ 		return errno;
+ 	}
+-	luks2_device_io io = { &fd, fd_read, fd_write, fd_size(fd) };
++	// the luks command's lock: nobody else changes it meanwhile
++	if (luks2_lock_fd(fd) == EWOULDBLOCK) {
++		close(fd);
++		result.AddString("error", B_TRANSLATE("Another program is changing "
++			"this partition."));
++		return B_BUSY;
++	}
++	// it may have been mounted or unlocked since the window opened
++	const char* inUse = in_use_message(job.path.String());
++	if (inUse != NULL) {
++		close(fd);
++		result.AddString("error", inUse);
++		return B_BUSY;
++	}
++	luks2_device_io io = { &fd, fd_read, fd_write, fd_size(fd),
++		luks2_fd_flush_cookie };
+ 
+ 	luks2_format_parameters parameters;
+ 	memset(&parameters, 0, sizeof(parameters));
+@@ -386,7 +419,7 @@ encrypt(Job& job, BMessage& result)
+ 	size_t keySize = 0;
+ 	int luks2Result = luks2_format(&io, &parameters, job.passphrase,
+ 		job.passphraseLength, key, &keySize);
+-	fsync(fd);
++		// flushes what it writes
+ 	close(fd);
+ 	if (luks2Result != LUKS2_OK) {
+ 		luks2_wipe(key, sizeof(key));
+@@ -531,6 +564,7 @@ private:
+ 			BButton*			fCancel;
+ 			BMessage*			fScriptRequest;
+ 			bool				fBusy;
++			bool				fTooLong;
+ };
+ 
+ 
+@@ -547,7 +581,8 @@ VolumeWindow::VolumeWindow(int mode, const char* path)
+ 	fRepeat(NULL),
+ 	fReadOnly(NULL),
+ 	fScriptRequest(NULL),
+-	fBusy(false)
++	fBusy(false),
++	fTooLong(false)
+ {
+ 	PartitionInfo info;
+ 	info.size = 0;
+@@ -655,7 +690,15 @@ VolumeWindow::_SetBusy(bool busy, const char* status)
+ void
+ VolumeWindow::_UpdateButton()
+ {
+-	bool enabled = !fBusy && fPassphrase->Text()[0] != '\0';
++	// longer passphrases aren't cut: the boot loader and luks take 512 bytes
++	bool tooLong = strlen(fPassphrase->Text()) > kMaxPassphraseLength;
++	if (tooLong != fTooLong && !fBusy) {
++		fTooLong = tooLong;
++		fStatus->SetText(tooLong ? B_TRANSLATE("The passphrase is longer "
++			"than 512 bytes.") : "");
++	}
++
++	bool enabled = !fBusy && fPassphrase->Text()[0] != '\0' && !tooLong;
+ 	if (fMode == kEncryptMode) {
+ 		enabled = enabled && fName->Text()[0] != '\0'
+ 			&& strcmp(fPassphrase->Text(), fRepeat->Text()) == 0;
+@@ -678,11 +721,13 @@ VolumeWindow::_ReplyToScript(BMessage& reply)
+ void
+ VolumeWindow::_Start(BMessage* request)
+ {
+-	if (fBusy || !fOK->IsEnabled()) {
++	size_t passphraseLength = strlen(fPassphrase->Text());
++	if (fBusy || !fOK->IsEnabled() || passphraseLength > kMaxPassphraseLength) {
+ 		if (request->IsSourceWaiting()) {
+ 			BMessage reply(B_REPLY);
+ 			reply.AddInt32("result", B_NOT_ALLOWED);
+-			reply.AddString("error", "not ready");
++			reply.AddString("error", passphraseLength > kMaxPassphraseLength
++				? "passphrase too long" : "not ready");
+ 			request->SendReply(&reply);
+ 		}
+ 		return;
+@@ -708,8 +753,9 @@ VolumeWindow::_Start(BMessage* request)
+ 	job->mode = fMode;
+ 	job->path = fPath;
+ 	job->passphrase = (char*)calloc(1, kMaxPassphraseLength + 1);
+-	strlcpy(job->passphrase, fPassphrase->Text(), kMaxPassphraseLength + 1);
+-	job->passphraseLength = strlen(job->passphrase);
++	memcpy(job->passphrase, fPassphrase->Text(), passphraseLength);
++		// checked above: it fits, nothing is cut off
++	job->passphraseLength = passphraseLength;
+ 	job->readOnly = fReadOnly != NULL && fReadOnly->Value() == B_CONTROL_ON;
+ 	if (fName != NULL)
+ 		job->volumeName = fName->Text();
+@@ -841,6 +887,18 @@ public:
+ 			return;
+ 		}
+ 
++		if (fMode == kEncryptMode) {
++			const char* inUse = in_use_message(fPath.String());
++			if (inUse != NULL) {
++				BString text(B_TRANSLATE("%path% can't be encrypted now. "
++					"%reason%"));
++				text.ReplaceFirst("%path%", fPath.String());
++				text.ReplaceFirst("%reason%", inUse);
++				_Fail(text.String());
++				return;
++			}
++		}
++
+ 		if (fMode == kUnlockMode) {
+ 			luks2_device_info info;
+ 			if (!luks2_partition_label(fPath.String(), NULL, 0, NULL, 0)) {
+@@ -868,8 +926,9 @@ private:
+ 	{
+ 		BAlert* alert = new BAlert(B_TRANSLATE("Encrypted volume"), text,
+ 			B_TRANSLATE("OK"), NULL, NULL, B_WIDTH_AS_USUAL, B_STOP_ALERT);
+-		alert->Go();
+-		Quit();
++		// asynchronous: the application stays scriptable, and quits when
++		// the alert is closed
++		alert->Go(new BInvoker(new BMessage(B_QUIT_REQUESTED), this));
+ 	}
+ 
+ private:
+diff --git a/src/bin/luks/luks.cpp b/src/bin/luks/luks.cpp
+index e34c6eca29..6436453355 100644
+--- a/src/bin/luks/luks.cpp
++++ b/src/bin/luks/luks.cpp
+@@ -112,19 +112,66 @@ device_size(int fd)
+ }
+ 
+ 
++/*!	Opens the device; for writing, with a lock that keeps other luks
++	commands (and EncryptedVolume) from changing the volume until it's
++	closed. */
+ static bool
+ open_device(const char* path, bool writable, Device& device)
+ {
+-	device.fd = open(path, writable ? O_RDWR : O_RDONLY);
++	int mode = writable ? O_RDWR : O_RDONLY;
++#ifdef __linux__
++	// Linux refuses an exclusive open of a block device that's mounted or
++	// mapped
++	struct stat st;
++	if (writable && stat(path, &st) == 0 && S_ISBLK(st.st_mode))
++		mode |= O_EXCL;
++#endif
++	device.fd = open(path, mode);
+ 	if (device.fd < 0) {
+ 		fprintf(stderr, "%s: can't open %s: %s\n", kProgramName, path,
+-			strerror(errno));
++			errno == EBUSY ? "it's in use" : strerror(errno));
++		return false;
++	}
++	if (writable && luks2_lock_fd(device.fd) == EWOULDBLOCK) {
++		fprintf(stderr, "%s: another program is changing %s; try again "
++			"when it's done\n", kProgramName, path);
++		close(device.fd);
+ 		return false;
+ 	}
+ 	device.io.cookie = &device.fd;
+ 	device.io.read = device_read;
+ 	device.io.write = writable ? device_write : NULL;
+ 	device.io.size = device_size(device.fd);
++	device.io.flush = writable ? luks2_fd_flush_cookie : NULL;
++	return true;
++}
++
++
++/*!	Refuses to overwrite a device someone uses: right before formatting it
++	or writing its data area. (Linux: the exclusive open did that.) */
++static bool
++check_not_in_use(const char* path)
++{
++#ifdef __HAIKU__
++	const char* reason = NULL;
++	switch (luks2_partition_in_use(path)) {
++		case LUKS2_IN_USE_MOUNTED:
++			reason = "it's mounted; unmount it first";
++			break;
++		case LUKS2_IN_USE_PARTITIONS:
++			reason = "it has partitions; remove them first";
++			break;
++		case LUKS2_IN_USE_OPEN:
++			reason = "it's open as an encrypted volume; close it first";
++			break;
++	}
++	if (reason != NULL) {
++		fprintf(stderr, "%s: %s: %s\n", kProgramName, path, reason);
++		return false;
++	}
++#else
++	(void)path;
++#endif
+ 	return true;
+ }
+ 
+@@ -358,10 +405,15 @@ command_format(const char* path)
+ 	Device device;
+ 	if (!open_device(path, true, device))
+ 		return 1;
++	if (!check_not_in_use(path)) {
++		close(device.fd);
++		return 1;
++	}
+ 
+ 	Passphrase passphrase;
+ 	if (!get_passphrase(sOptions.keyFile, "Passphrase for the new volume: ",
+ 			true, passphrase)) {
++		close(device.fd);
+ 		return 1;
+ 	}
+ 
+@@ -374,18 +426,22 @@ command_format(const char* path)
+ 	if (!choose_kdf(parameters.kdf))
+ 		return 1;
+ 
++	// again: the passphrase prompt may have taken a while
++	if (!check_not_in_use(path)) {
++		close(device.fd);
++		return 1;
++	}
+ 	uint8_t key[LUKS2_MAX_KEY_SIZE];
+ 	size_t keySize;
+ 	int result = luks2_format(&device.io, &parameters, passphrase.data,
+ 		passphrase.length, key, &keySize);
+ 	luks2_wipe(key, sizeof(key));
++	close(device.fd);
+ 	if (result != LUKS2_OK) {
+ 		fprintf(stderr, "%s: formatting %s failed: %s\n", kProgramName, path,
+ 			luks2_error_string(result));
+ 		return 1;
+ 	}
+-	fsync(device.fd);
+-	close(device.fd);
+ 
+ 	printf("%s: LUKS2, aes-xts-plain64 (%u bits), sector size %u, keyslot 0: ",
+ 		path, parameters.key_size * 8,
+@@ -422,9 +478,10 @@ command_dump(const char* path)
+ 	printf("  UUID:          %s\n", volume->uuid);
+ 	printf("  label:         %s\n", volume->label[0] ? volume->label
+ 		: "(none)");
+-	printf("  header:        %llu bytes, sequence %llu, %s%s\n",
++	printf("  header:        %llu bytes, sequence %llu (%s copy), %s%s\n",
+ 		(unsigned long long)volume->header_size,
+ 		(unsigned long long)volume->sequence_id,
++		volume->active_copy == 0 ? "primary" : "secondary",
+ 		volume->primary_valid ? "primary ok" : "PRIMARY DAMAGED",
+ 		volume->secondary_valid ? ", secondary ok" : ", SECONDARY DAMAGED");
+ 	printf("  data:          offset %llu, ",
+@@ -444,8 +501,9 @@ command_dump(const char* path)
+ 			continue;
+ 		}
+ 		print_kdf(keyslot.kdf);
+-		printf(", %u stripes, priority %d\n", keyslot.stripes,
+-			keyslot.priority);
++		printf(", %u stripes, priority %d%s\n", keyslot.stripes,
++			keyslot.priority, keyslot.digest != volume->segment_digest
++				? ", unbound (opens no data)" : "");
+ 	}
+ 	luks2_free_volume(volume);
+ 	close(device.fd);
+@@ -520,7 +578,6 @@ command_add_key(const char* path)
+ 	}
+ 	luks2_wipe(key, sizeof(key));
+ 	luks2_free_volume(volume);
+-	fsync(device.fd);
+ 	close(device.fd);
+ 	if (result != LUKS2_OK) {
+ 		fprintf(stderr, "%s: adding a keyslot failed: %s\n", kProgramName,
+@@ -556,12 +613,19 @@ command_remove_key(const char* path, int slotToRemove)
+ 	if (slotToRemove < 0)
+ 		slotToRemove = openedSlot;
+ 
++	// what's left to open the data with: keyslots bound to its digest (an
++	// unbound keyslot holds some other key)
++	const luks2_keyslot* keyslots = volume->keyslots;
++	bool removingBound = keyslots[slotToRemove].used
++		&& keyslots[slotToRemove].digest == volume->segment_digest;
+ 	int remaining = 0;
+ 	for (int i = 0; i < LUKS2_MAX_KEYSLOTS; i++) {
+-		if (volume->keyslots[i].used && i != slotToRemove)
++		if (keyslots[i].used && keyslots[i].digest == volume->segment_digest
++			&& i != slotToRemove) {
+ 			remaining++;
++		}
+ 	}
+-	if (remaining == 0 && !sOptions.force) {
++	if (removingBound && remaining == 0 && !sOptions.force) {
+ 		fprintf(stderr, "%s: keyslot %d is the last one; without it the "
+ 			"volume can't be opened any more. Use --force to remove it "
+ 			"anyway.\n", kProgramName, slotToRemove);
+@@ -571,7 +635,6 @@ command_remove_key(const char* path, int slotToRemove)
+ 
+ 	result = luks2_remove_keyslot(volume, &device.io, slotToRemove);
+ 	luks2_free_volume(volume);
+-	fsync(device.fd);
+ 	close(device.fd);
+ 	if (result != LUKS2_OK) {
+ 		fprintf(stderr, "%s: removing keyslot %d failed: %s\n", kProgramName,
+@@ -617,15 +680,31 @@ command_copy(const char* path, const char* file, bool write)
+ 
+ 	uint64_t total = volume->segment.size;
+ 	if (write) {
+-		struct stat st;
+-		if (fstat(fileFD, &st) == 0 && (uint64_t)st.st_size < total)
+-			total = st.st_size;
+-		if (total % volume->segment.sector_size != 0) {
+-			fprintf(stderr, "%s: %s isn't a whole number of %u-byte "
+-				"sectors\n", kProgramName, file, volume->segment.sector_size);
+-			total = 0;
+-			result = LUKS2_ERROR_BAD_ARGUMENT;
++		// all of the file or nothing: check it fits before writing
++		uint64_t fileSize = device_size(fileFD);
++		const char* problem = NULL;
++		if (fileSize == 0)
++			problem = "is empty or its size is unknown";
++		else if (fileSize > total)
++			problem = "is larger than the data area";
++		else if (fileSize % volume->segment.sector_size != 0)
++			problem = "isn't a whole number of sectors";
++		else if (!check_not_in_use(path))
++			problem = "";
++		if (problem != NULL) {
++			if (problem[0] != '\0') {
++				fprintf(stderr, "%s: %s (%llu bytes) %s (%llu bytes, %u-byte "
++					"sectors)\n", kProgramName, file,
++					(unsigned long long)fileSize, problem,
++					(unsigned long long)total, volume->segment.sector_size);
++			}
++			luks2_xts_clear(&xts);
++			luks2_free_volume(volume);
++			close(fileFD);
++			close(device.fd);
++			return 1;
+ 		}
++		total = fileSize;
+ 	}
+ 
+ 	const size_t bufferSize = 1024 * 1024;
+@@ -670,10 +749,10 @@ command_copy(const char* path, const char* file, bool write)
+ 
+ 	luks2_xts_clear(&xts);
+ 	luks2_free_volume(volume);
+-	if (write)
+-		fsync(device.fd);
+-	else
+-		fsync(fileFD);
++	if (result == LUKS2_OK
++		&& (write ? luks2_fd_flush(device.fd) : luks2_fd_flush(fileFD)) != 0) {
++		result = LUKS2_ERROR_IO;
++	}
+ 	close(fileFD);
+ 	close(device.fd);
+ 	if (result != LUKS2_OK) {
+diff --git a/src/libs/luks2/luks2_internal.h b/src/libs/luks2/luks2_internal.h
+index 48b81fdd76..ee584d6f49 100644
+--- a/src/libs/luks2/luks2_internal.h
++++ b/src/libs/luks2/luks2_internal.h
+@@ -54,6 +54,11 @@ int luks2_derive_keyslot_key(const luks2_kdf* kdf, const void* passphrase,
+ // parses volume->json into the structures of volume
+ int luks2_parse_metadata(luks2_volume* volume, uint64_t deviceSize);
+ 
++/*!	Reads both header copies again: LUKS2_ERROR_CHANGED unless they are as
++	when \a volume was read (or last written). */
++int luks2_check_unchanged(const luks2_volume* volume,
++	const luks2_device_io* io);
++
+ static inline uint64_t
+ luks2_round_up(uint64_t value, uint64_t alignment)
+ {
+diff --git a/src/libs/luks2/luks2_partitions.cpp b/src/libs/luks2/luks2_partitions.cpp
+index 570a55a498..c69b283821 100644
+--- a/src/libs/luks2/luks2_partitions.cpp
++++ b/src/libs/luks2/luks2_partitions.cpp
+@@ -10,24 +10,41 @@
+ 
+ #include <luks2/luks2_userland.h>
+ 
++#include <ctype.h>
++#include <dirent.h>
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/ioctl.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
++#ifdef __HAIKU__
++#	include <fs_info.h>
++#endif
++
+ 
+ // local copies, so that this file needs nothing else of the LUKS2 code
+ static bool
+-has_luks2_signature(const uint8_t* header)
++has_luks2_signature(const uint8_t* header, bool primary)
+ {
+-	static const uint8_t kMagic[] = { 'L', 'U', 'K', 'S', 0xba, 0xbe, 0, 2 };
+-	return memcmp(header, kMagic, sizeof(kMagic)) == 0;
++	static const uint8_t kPrimary[] = { 'L', 'U', 'K', 'S', 0xba, 0xbe, 0, 2 };
++	static const uint8_t kSecondary[] = { 'S', 'K', 'U', 'L', 0xba, 0xbe, 0,
++		2 };
++	return memcmp(header, primary ? kPrimary : kSecondary, sizeof(kPrimary))
++		== 0;
+ }
+ 
+ 
++// where a secondary header copy can be: behind a primary of each size
++static const off_t kSecondaryOffsets[] = {
++	0x4000, 0x8000, 0x10000, 0x20000, 0x40000, 0x80000, 0x100000, 0x200000,
++	0x400000
++};
++
++
+ static void
+ copy_header_string(char* target, size_t targetSize, const uint8_t* source,
+ 	size_t sourceSize)
+@@ -50,12 +67,19 @@ luks2_partition_label(const char* path, char* label, size_t labelSize,
+ 	if (fd < 0)
+ 		return false;
+ 	uint8_t header[512];
+-	ssize_t bytesRead = pread(fd, header, sizeof(header), 0);
++	bool found = pread(fd, header, sizeof(header), 0) == (ssize_t)sizeof(header)
++		&& has_luks2_signature(header, true);
++	// a damaged primary: the secondary copy has the same fields
++	for (size_t i = 0; !found
++			&& i < sizeof(kSecondaryOffsets) / sizeof(kSecondaryOffsets[0]);
++			i++) {
++		found = pread(fd, header, sizeof(header), kSecondaryOffsets[i])
++				== (ssize_t)sizeof(header)
++			&& has_luks2_signature(header, false);
++	}
+ 	close(fd);
+-	if (bytesRead != (ssize_t)sizeof(header)
+-		|| !has_luks2_signature(header)) {
++	if (!found)
+ 		return false;
+-	}
+ 
+ 	// binary header: label at 24 (48 bytes), UUID at 168 (40 bytes)
+ 	copy_header_string(label, labelSize, header + 24, 48);
+@@ -154,6 +178,81 @@ luks2_open_device(const char* path, const uint8_t* key, size_t keySize,
+ }
+ 
+ 
++static bool
++same_file(const struct stat& a, const char* path)
++{
++	struct stat b;
++	return stat(path, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
++}
++
++
++/*!	Partitions of a disk device are published next to its "raw" device
++	(/dev/disk/.../0, 1, ...); those of a partition next to it, with its
++	name and "_" in front (0_0, 0_1, ...). */
++static bool
++has_partitions(const char* path)
++{
++	if (strncmp(path, "/dev/disk/", 10) != 0)
++		return false;
++	char directory[PATH_MAX];
++	strlcpy(directory, path, sizeof(directory));
++	char* slash = strrchr(directory, '/');
++	if (slash == NULL)
++		return false;
++	*slash = '\0';
++	const char* name = slash + 1;
++	size_t nameLength = strlen(name);
++	bool isDisk = strcmp(name, "raw") == 0;
++
++	DIR* dir = opendir(directory);
++	if (dir == NULL)
++		return false;
++	bool found = false;
++	while (struct dirent* entry = readdir(dir)) {
++		const char* other = entry->d_name;
++		if (isDisk ? isdigit((unsigned char)other[0])
++				: strncmp(other, name, nameLength) == 0
++					&& other[nameLength] == '_') {
++			found = true;
++			break;
++		}
++	}
++	closedir(dir);
++	return found;
++}
++
++
++extern "C" int
++luks2_partition_in_use(const char* path)
++{
++	char resolved[PATH_MAX];
++	if (realpath(path, resolved) == NULL)
++		strlcpy(resolved, path, sizeof(resolved));
++
++	luks2_device_info info;
++	if (luks2_find_open_device(resolved, &info) == B_OK)
++		return LUKS2_IN_USE_OPEN;
++
++	struct stat st;
++	if (stat(resolved, &st) == 0) {
++		int32 cookie = 0;
++		dev_t volume;
++		while ((volume = next_dev(&cookie)) >= 0) {
++			fs_info fsInfo;
++			if (fs_stat_dev(volume, &fsInfo) == 0
++				&& fsInfo.device_name[0] == '/'
++				&& same_file(st, fsInfo.device_name)) {
++				return LUKS2_IN_USE_MOUNTED;
++			}
++		}
++	}
++
++	if (has_partitions(resolved))
++		return LUKS2_IN_USE_PARTITIONS;
++	return LUKS2_NOT_IN_USE;
++}
++
++
+ extern "C" status_t
+ luks2_close_device(int32 id)
+ {
+diff --git a/src/libs/luks2/luks2_read.cpp b/src/libs/luks2/luks2_read.cpp
+index 942b5481f4..409727d8f2 100644
+--- a/src/libs/luks2/luks2_read.cpp
++++ b/src/libs/luks2/luks2_read.cpp
+@@ -656,6 +656,46 @@ luks2_has_signature(const void* firstSector, size_t length)
+ }
+ 
+ 
++extern "C" bool
++luks2_probe(const luks2_device_io* io)
++{
++	uint8_t start[8];
++	if (read_fully(io, 0, start, sizeof(start))
++		&& luks2_has_signature(start, sizeof(start))) {
++		return true;
++	}
++	for (size_t i = 0; i < kLUKS2HeaderSizeCount; i++) {
++		if (read_fully(io, kLUKS2HeaderSizes[i], start, sizeof(start))
++			&& memcmp(start, kLUKS2SecondaryMagic, LUKS2_MAGIC_SIZE) == 0
++			&& start[LUKS2_OFFSET_VERSION] == 0
++			&& start[LUKS2_OFFSET_VERSION + 1] == 2) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++int
++luks2_check_unchanged(const luks2_volume* volume, const luks2_device_io* io)
++{
++	HeaderCopy copies[2];
++	read_header_copy(io, 0, true, copies[0]);
++	read_header_copy(io, volume->header_size, false, copies[1]);
++
++	bool unchanged = true;
++	for (int i = 0; i < 2; i++) {
++		if (copies[i].valid != volume->copy_checksum_valid[i]
++			|| (copies[i].valid
++				&& copies[i].sequenceID != volume->copy_sequence_id[i])) {
++			unchanged = false;
++		}
++		free(copies[i].data);
++	}
++	return unchanged ? LUKS2_OK : LUKS2_ERROR_CHANGED;
++}
++
++
+ extern "C" int
+ luks2_read_header(const luks2_device_io* io, luks2_volume** _volume)
+ {
+@@ -684,8 +724,10 @@ luks2_read_header(const luks2_device_io* io, luks2_volume** _volume)
+ 		return LUKS2_ERROR_NOT_LUKS2;
+ 	}
+ 
+-	// The newer valid copy wins (the primary when they're the same); if its
+-	// metadata doesn't hold up, the other one is tried.
++	// The newer valid copy wins (the primary when they're the same). Only
++	// if its metadata is damaged is the other one tried: metadata that asks
++	// for an unsupported feature (a reencryption, say) is valid, and an
++	// older copy could describe a layout that no longer holds.
+ 	HeaderCopy* first = &primary;
+ 	HeaderCopy* second = &secondary;
+ 	if (!primary.valid
+@@ -697,6 +739,7 @@ luks2_read_header(const luks2_device_io* io, luks2_volume** _volume)
+ 	int result = LUKS2_ERROR_CORRUPT;
+ 	luks2_volume* volume = NULL;
+ 	HeaderCopy* copies[2] = { first, second };
++	bool metadataDamaged[2] = { false, false };
+ 	for (int i = 0; i < 2; i++) {
+ 		if (!copies[i]->valid)
+ 			continue;
+@@ -708,15 +751,30 @@ luks2_read_header(const luks2_device_io* io, luks2_volume** _volume)
+ 		}
+ 		int candidateResult = volume_from_copy(io, *copies[i], candidate);
+ 		if (candidateResult == LUKS2_OK) {
+-			candidate->primary_valid = primary.valid;
+-			candidate->secondary_valid = secondary.valid;
++			// a copy whose metadata failed counts as damaged
++			bool primaryDamaged = copies[0] == &primary
++				? metadataDamaged[0] : metadataDamaged[1];
++			bool secondaryDamaged = copies[0] == &secondary
++				? metadataDamaged[0] : metadataDamaged[1];
++			candidate->primary_valid = primary.valid && !primaryDamaged;
++			candidate->secondary_valid = secondary.valid
++				&& !secondaryDamaged;
++			candidate->active_copy = copies[i] == &primary ? 0 : 1;
++			candidate->copy_checksum_valid[0] = primary.valid;
++			candidate->copy_checksum_valid[1] = secondary.valid;
++			candidate->copy_sequence_id[0] = primary.valid
++				? primary.sequenceID : 0;
++			candidate->copy_sequence_id[1] = secondary.valid
++				? secondary.sequenceID : 0;
+ 			volume = candidate;
+ 			result = LUKS2_OK;
+ 			break;
+ 		}
+ 		luks2_free_volume(candidate);
+-		if (i == 0)
+-			result = candidateResult;
++		result = candidateResult;
++		if (candidateResult != LUKS2_ERROR_CORRUPT)
++			break;
++		metadataDamaged[i] = true;
+ 	}
+ 
+ 	free(primary.data);
+diff --git a/src/libs/luks2/luks2_userland.cpp b/src/libs/luks2/luks2_userland.cpp
+index f00b778805..89a0bbe3b1 100644
+--- a/src/libs/luks2/luks2_userland.cpp
++++ b/src/libs/luks2/luks2_userland.cpp
+@@ -13,10 +13,14 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <string.h>
++#include <sys/file.h>
++#include <sys/ioctl.h>
++#include <sys/stat.h>
+ #include <time.h>
+ #include <unistd.h>
+ 
+ #ifdef __HAIKU__
++#	include <Drivers.h>
+ #	include <OS.h>
+ #else
+ #	include <sys/random.h>
+@@ -165,3 +169,51 @@ luks2_choose_digest_iterations(void)
+ 	uint32_t iterations = (uint32_t)(rate / 8);
+ 	return iterations < 1000 ? 1000 : iterations;
+ }
++
++
++extern "C" int
++luks2_fd_flush(int fd)
++{
++	struct stat st;
++	if (fstat(fd, &st) != 0)
++		return errno;
++#ifdef __HAIKU__
++	if (!S_ISREG(st.st_mode)) {
++		// devfs ignores fsync(): the driver flushes the drive's cache
++		if (ioctl(fd, B_FLUSH_DRIVE_CACHE, NULL, 0) != 0
++			&& errno != B_DEV_INVALID_IOCTL && errno != B_BAD_VALUE
++			&& errno != B_NOT_SUPPORTED) {
++			return errno;
++		}
++		return 0;
++	}
++#endif
++	// a file, or a Linux block device (whose fsync() flushes the cache);
++	// EINVAL: a special file with nothing to synchronise
++	while (fsync(fd) != 0) {
++		if (errno == EINVAL && !S_ISREG(st.st_mode))
++			return 0;
++		if (errno != EINTR)
++			return errno;
++	}
++	return 0;
++}
++
++
++extern "C" int
++luks2_fd_flush_cookie(void* fdPointer)
++{
++	return luks2_fd_flush(*(int*)fdPointer);
++}
++
++
++extern "C" int
++luks2_lock_fd(int fd)
++{
++	while (flock(fd, LOCK_EX | LOCK_NB) != 0) {
++		if (errno == EINTR)
++			continue;
++		return errno == EAGAIN ? EWOULDBLOCK : errno;
++	}
++	return 0;
++}
+diff --git a/src/libs/luks2/luks2_util.cpp b/src/libs/luks2/luks2_util.cpp
+index 9ebcb82e12..38b52a29a5 100644
+--- a/src/libs/luks2/luks2_util.cpp
++++ b/src/libs/luks2/luks2_util.cpp
+@@ -208,6 +208,8 @@ luks2_error_string(int error)
+ 			return "no random numbers";
+ 		case LUKS2_ERROR_READ_ONLY:
+ 			return "the device is read-only";
++		case LUKS2_ERROR_CHANGED:
++			return "the header was changed by another program meanwhile";
+ 	}
+ 	return "unknown error";
+ }
+diff --git a/src/libs/luks2/luks2_write.cpp b/src/libs/luks2/luks2_write.cpp
+index fe6c1571f7..fa08b655bd 100644
+--- a/src/libs/luks2/luks2_write.cpp
++++ b/src/libs/luks2/luks2_write.cpp
+@@ -30,6 +30,14 @@ write_fully(const luks2_device_io* io, uint64_t offset, const void* buffer,
+ }
+ 
+ 
++//! Makes the writes so far durable before the next step of a change.
++bool
++flush_device(const luks2_device_io* io)
++{
++	return io->flush == NULL || io->flush(io->cookie) == 0;
++}
++
++
+ luks2_json*
+ new_string(const char* text)
+ {
+@@ -63,10 +71,21 @@ index_string(int index, char* buffer)
+ 
+ 
+ /*!	Writes both header copies from volume->json with the next sequence ID
+-	and a fresh salt for each copy. */
++	and a fresh salt for each copy, one after the other with a flush after
++	each: a crash leaves at least one valid copy, the old or the new one.
++	A copy that's damaged (or out of date) is written first, so the one
++	valid copy is replaced only once the other holds the new header.
++	\a existing: the volume is on the device (not being created); its
++	header must not have changed since it was read. */
+ int
+-write_headers(luks2_volume* volume, const luks2_device_io* io)
++write_headers(luks2_volume* volume, const luks2_device_io* io, bool existing)
+ {
++	if (existing) {
++		int result = luks2_check_unchanged(volume, io);
++		if (result != LUKS2_OK)
++			return result;
++	}
++
+ 	size_t size = (size_t)volume->header_size;
+ 	uint8_t* area = (uint8_t*)calloc(1, size);
+ 	if (area == NULL)
+@@ -82,8 +101,16 @@ write_headers(luks2_volume* volume, const luks2_device_io* io)
+ 	}
+ 
+ 	uint64_t sequenceID = volume->sequence_id + 1;
++	int order[2] = { 0, 1 };
++	if (volume->primary_valid
++		&& (!volume->secondary_valid || volume->active_copy == 0)) {
++		// the primary is the copy that's read: replace it last
++		order[0] = 1;
++		order[1] = 0;
++	}
+ 	int result = LUKS2_OK;
+-	for (int copy = 0; copy < 2 && result == LUKS2_OK; copy++) {
++	for (int i = 0; i < 2 && result == LUKS2_OK; i++) {
++		int copy = order[i];
+ 		uint64_t offset = copy == 0 ? 0 : volume->header_size;
+ 		memset(area, 0, LUKS2_BINARY_HEADER_SIZE);
+ 		memcpy(area + LUKS2_OFFSET_MAGIC,
+@@ -110,7 +137,7 @@ write_headers(luks2_volume* volume, const luks2_device_io* io)
+ 		luks2_sha256_update(&hash, area, size);
+ 		luks2_sha256_final(&hash, area + LUKS2_OFFSET_CHECKSUM);
+ 
+-		if (!write_fully(io, offset, area, size))
++		if (!write_fully(io, offset, area, size) || !flush_device(io))
+ 			result = LUKS2_ERROR_IO;
+ 	}
+ 
+@@ -120,6 +147,11 @@ write_headers(luks2_volume* volume, const luks2_device_io* io)
+ 		volume->header_hash = LUKS2_HASH_SHA256;
+ 		volume->primary_valid = true;
+ 		volume->secondary_valid = true;
++		volume->active_copy = 0;
++		for (int copy = 0; copy < 2; copy++) {
++			volume->copy_checksum_valid[copy] = true;
++			volume->copy_sequence_id[copy] = sequenceID;
++		}
+ 	}
+ 	return result;
+ }
+@@ -207,12 +239,13 @@ valid_kdf(const luks2_kdf* kdf)
+ 
+ 
+ /*!	Encrypts \a key into a new keyslot area and adds the keyslot to the
+-	JSON metadata (not to the digest). */
++	JSON metadata (not to the digest). The material is flushed before the
++	header can point to it. \a existing: as for write_headers(). */
+ int
+ create_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 	const uint8_t* key, size_t keySize, const void* passphrase,
+ 	size_t passphraseLength, const luks2_kdf* kdfParameters, int slot,
+-	uint32_t stripes)
++	uint32_t stripes, bool existing)
+ {
+ 	luks2_kdf kdf = *kdfParameters;
+ 	kdf.salt_length = 32;
+@@ -252,8 +285,14 @@ create_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 				material + sector * LUKS2_KEYSLOT_SECTOR_SIZE,
+ 				LUKS2_KEYSLOT_SECTOR_SIZE);
+ 		}
+-		if (!write_fully(io, areaOffset, material, encryptedSize))
++		// the key derivation took a while: the area must still be free
++		if (existing)
++			result = luks2_check_unchanged(volume, io);
++		if (result == LUKS2_OK
++			&& (!write_fully(io, areaOffset, material, encryptedSize)
++				|| !flush_device(io))) {
+ 			result = LUKS2_ERROR_IO;
++		}
+ 	}
+ 
+ 	if (xts != NULL) {
+@@ -511,10 +550,10 @@ luks2_format(const luks2_device_io* io,
+ 
+ 	if (result == LUKS2_OK) {
+ 		result = create_keyslot(volume, io, key, keySize, passphrase,
+-			passphraseLength, &parameters->kdf, 0, stripes);
++			passphraseLength, &parameters->kdf, 0, stripes, false);
+ 	}
+ 	if (result == LUKS2_OK)
+-		result = write_headers(volume, io);
++		result = write_headers(volume, io, false);
+ 
+ 	if (result == LUKS2_OK && keyOut != NULL) {
+ 		memcpy(keyOut, key, keySize);
+@@ -562,12 +601,17 @@ luks2_add_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 
+ 	uint32_t stripes = LUKS2_STRIPES;
+ 
++	// before the key derivation, so a changed header fails early
++	result = luks2_check_unchanged(volume, io);
++	if (result != LUKS2_OK)
++		return result;
++
+ 	luks2_json* backup = luks2_json_clone(volume->json);
+ 	if (backup == NULL)
+ 		return LUKS2_ERROR_NO_MEMORY;
+ 
+ 	result = create_keyslot(volume, io, key, keySize, passphrase,
+-		passphraseLength, kdf, slot, stripes);
++		passphraseLength, kdf, slot, stripes, true);
+ 	if (result == LUKS2_OK) {
+ 		char name[4];
+ 		index_string(slot, name);
+@@ -582,7 +626,7 @@ luks2_add_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 		}
+ 	}
+ 	if (result == LUKS2_OK)
+-		result = write_headers(volume, io);
++		result = write_headers(volume, io, true);
+ 	if (result == LUKS2_OK)
+ 		result = refresh_volume(volume, io);
+ 
+@@ -631,7 +675,7 @@ luks2_remove_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 		luks2_json_remove_string(luks2_json_get(token, "keyslots"), name);
+ 	}
+ 
+-	int result = write_headers(volume, io);
++	int result = write_headers(volume, io, true);
+ 	if (result == LUKS2_OK)
+ 		result = refresh_volume(volume, io);
+ 	if (result != LUKS2_OK) {
+@@ -657,5 +701,7 @@ luks2_remove_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 			result = LUKS2_ERROR_IO;
+ 	}
+ 	free(noise);
++	if (result == LUKS2_OK && !flush_device(io))
++		result = LUKS2_ERROR_IO;
+ 	return result;
+ }
+diff --git a/src/system/boot/loader/luks.cpp b/src/system/boot/loader/luks.cpp
+index 26da180031..a51a22fbfc 100644
+--- a/src/system/boot/loader/luks.cpp
++++ b/src/system/boot/loader/luks.cpp
+@@ -268,7 +268,8 @@ header_read(void* cookie, uint64_t offset, void* buffer, size_t size)
+ static luks2_device_io
+ volume_io(LockedVolume* volume)
+ {
+-	luks2_device_io io = { volume, header_read, NULL, (uint64_t)volume->size };
++	luks2_device_io io = { volume, header_read, NULL, (uint64_t)volume->size,
++		NULL };
+ 	return io;
+ }
+ 
+@@ -276,14 +277,21 @@ volume_io(LockedVolume* volume)
+ // #pragma mark - locked volumes
+ 
+ 
++static ssize_t
++partition_read(void* cookie, uint64_t offset, void* buffer, size_t size)
++{
++	return ((Partition*)cookie)->ReadAt(NULL, offset, buffer, size);
++}
++
++
+ bool
+ luks_probe_partition(Partition* partition)
+ {
+-	uint8 first[512];
+-	if (partition->ReadAt(NULL, 0, first, sizeof(first)) != sizeof(first)
+-		|| !luks2_has_signature(first, sizeof(first))) {
++	// the primary header, or the secondary one if the primary is damaged
++	luks2_device_io probe = { partition, partition_read, NULL,
++		(uint64_t)partition->Size(), NULL };
++	if (!luks2_probe(&probe))
+ 		return false;
+-	}
+ 
+ 	LockedVolume* volume = (LockedVolume*)calloc(1, sizeof(LockedVolume));
+ 	if (volume == NULL)
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 337f58ca3a..e01978512a 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -389,8 +389,8 @@ take_boot_volume_keys(KMessage& bootVolume)
+ 
+ /*!	Opens the encrypted volumes the boot loader unlocked with the keys it
+ 	passed, through the luks_disk driver, which checks each key against the
+-	volume's header. The partitions are found by the LUKS2 UUID in their
+-	primary header. Returns whether a volume was opened (and the devices
++	volume's header. The partitions are found by their LUKS2 UUID (and
++	place, which the loader passes too). Returns whether a volume was opened (and the devices
+ 	need another scan).
+ */
+ static bool
+@@ -420,18 +420,14 @@ open_encrypted_boot_volumes(KDiskDeviceManager* manager)
+ 				return false;
+ 			}
+ 
+-			uint8 header[512];
+-			if (read_pos(partition->Device()->FD(), partition->Offset(),
+-					header, sizeof(header)) != (ssize_t)sizeof(header)) {
+-				return false;
+-			}
+-			static const uint8 kMagic[] = { 'L', 'U', 'K', 'S', 0xba, 0xbe,
+-				0, 2 };
+-			if (memcmp(header, kMagic, sizeof(kMagic)) != 0)
++			// the UUID from the header copy the driver will use, as the
++			// boot loader did (the secondary when the primary is damaged)
++			KPath path;
++			if (partition->GetPath(&path) != B_OK)
+ 				return false;
+ 			char uuid[40];
+-			memcpy(uuid, header + 168, sizeof(uuid));
+-			uuid[sizeof(uuid) - 1] = '\0';
++			if (fLUKS->volume_uuid(path.Path(), uuid, sizeof(uuid)) != B_OK)
++				return false;
+ 
+ 			for (int32 i = 0; i < sBootVolumeKeyCount; i++) {
+ 				BootVolumeKey& entry = sBootVolumeKeys[i];
+@@ -442,9 +438,6 @@ open_encrypted_boot_volumes(KDiskDeviceManager* manager)
+ 					continue;
+ 				}
+ 
+-				KPath path;
+-				if (partition->GetPath(&path) != B_OK)
+-					return false;
+ 				char device[B_PATH_NAME_LENGTH];
+ 				status_t status = fLUKS->open_volume(path.Path(), entry.key,
+ 					entry.keySize, device, sizeof(device));
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index 0c9e389ce3..411813a5d7 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -15,11 +15,23 @@ UndefinedBehaviorSanitizer) and runs:
+   RFC 9106 (Argon2d/i/id);
+ - `crypto_crosscheck.py`: random XTS, PBKDF2 and Argon2 inputs against
+   OpenSSL (Python's `cryptography`, `hashlib`, `openssl kdf`);
+-- `cryptsetup_test.sh`: 40 interoperability tests with Linux's cryptsetup in
++- `cryptsetup_test.sh`: interoperability tests with Linux's cryptsetup in
+   both directions (both KDFs and their parameters, several keyslots,
+   priorities, killed slots, damaged headers, LUKS1 and interrupted
+   reencryptions refused, data encrypted by cryptsetup decrypted byte for
+-  byte, our data decrypted with cryptsetup's volume key and OpenSSL);
++  byte, our data decrypted with cryptsetup's volume key and OpenSSL), hostile
++  headers made by `craft_header.py`, and the cases of the correctness review
++  of 2026-11-11: a newer header copy the code doesn't support isn't replaced
++  by the older one, cryptsetup's unbound keyslots don't count as a way into
++  the data, two `luks` commands on one volume (the second is refused), a
++  header cryptsetup changes while `luks` waits for a passphrase, `luks write`
++  with a file that doesn't fit;
++- `crash_test` (built by `build_host.sh`, run by `cryptsetup_test.sh`): adds
++  and removes keyslots on a disk in memory that loses power after each write
++  and flush in turn, with every fate of the writes not yet flushed (lost,
++  kept, torn either way); every state must still open with the passphrase
++  that was there before. `crash_test --no-flush` must find states that
++  don't (the model notices missing flushes);
+ - `crypto_test benchmark`.
+ 
+ cryptsetup works on image files without root; only `--disable-locks` is
+@@ -36,15 +48,22 @@ software emulation (`-cpu max` emulates AES-NI).
+   (`qemu/guest-driver-test.sh` runs in Haiku at boot): a volume cryptsetup
+   encrypted, writes onto a cryptsetup volume (checked on the host with
+   cryptsetup's key), a volume formatted on Haiku with BFS inside, reopened,
+-  read-only, keyslots added and removed on Haiku and checked by cryptsetup.
++  read-only, keyslots added and removed on Haiku and checked by cryptsetup;
++  a GPT disk that `luks format` must refuse (it has partitions) while its
++  partition may be formatted; an open volume and its mounted device that
++  `luks format` and `luks write` must leave alone; a second `luks` command
++  refused while the first holds the volume's lock.
+ - `qemu/run-boot-test.sh`: an encrypted system volume: a GPT disk with an ESP
+   holding the new `haiku_loader.efi` and a LUKS2 partition holding the
+   system BFS volume. `qemu/boot_console.py` types the passphrase into the
+   boot loader through OVMF's serial console, saves the guest's RAM after
+   boot, and drives the boot menu. Boot 1 with AES-NI, boot 2 with a wrong
+   passphrase first and without AES-NI, boot 3 through the boot menu's
+-  "Unlock encrypted volume" item; the RAM after boots 1 and 2 must hold no
+-  copy of the volume key; the host reads back what Haiku wrote.
++  "Unlock encrypted volume" item, boot 4 with a 512 MiB argon2id keyslot
++  cryptsetup added, boot 5 with the primary header's UUID damaged and boot 6
++  with its magic damaged too (the loader and the kernel must both use the
++  secondary copy); the RAM after boots 1 and 2 must hold no copy of the
++  volume key; the host reads back what Haiku wrote.
+ 
+ - `qemu/run-ui-test.sh`: the Haiku side, on the desktop, driven over ssh
+   (a test key; sshd started at boot by a launch job) with `hey`
+@@ -52,7 +71,10 @@ software emulation (`-cpu max` emulates AES-NI).
+   BFS, mounted); unmounting through mount_server, as Tracker does, locks it
+   (eject); Tracker's unlock message starts EncryptedVolume, a wrong and
+   then the right passphrase mount it again with the files intact;
+-  `EncryptedVolume --lock` (DriveSetup's Lock); a partition of a GPT disk
++  `EncryptedVolume --lock` (DriveSetup's Lock); a 513-byte passphrase is
++  refused (not cut to 512), a volume unlocked while the Encrypt window is
++  open isn't overwritten, `--encrypt` on a mounted device is refused; a
++  partition of a GPT disk
+   encrypted, Installer installs onto it and puts its EFI loader on the
+   disk's ESP; then that disk boots on its own and asks for the passphrase.
+   Needs `qemu/locale-settings` (en_US; or `LOCALE_SETTINGS`) so
+diff --git a/src/tests/system/luks2/build_host.sh b/src/tests/system/luks2/build_host.sh
+index d074ffa9e5..7a528ded09 100755
+--- a/src/tests/system/luks2/build_host.sh
++++ b/src/tests/system/luks2/build_host.sh
+@@ -23,3 +23,5 @@ g++ $CF "$R/src/tests/system/luks2/crypto_test.cpp" "$B/aes_ct.o" \
+ 	"$B/aes_xts.o" "$B/sha2_hmac.o" "$B/argon2.o" "$B/aes_ni.o" \
+ 	-o "$B/crypto_test"
+ g++ $CF "$R/src/bin/luks/luks.cpp" "$B"/*.o -o "$B/luks"
++g++ $CF "$R/src/tests/system/luks2/crash_test.cpp" "$B"/*.o \
++	-o "$B/crash_test"
+diff --git a/src/tests/system/luks2/craft_header.py b/src/tests/system/luks2/craft_header.py
+index 00aa60f056..efc8a2c6ed 100755
+--- a/src/tests/system/luks2/craft_header.py
++++ b/src/tests/system/luks2/craft_header.py
+@@ -3,8 +3,9 @@
+ # Distributed under the terms of the MIT License.
+ #
+ # Makes a damaged or hostile LUKS2 header for the negative tests: rewrites
+-# the JSON metadata of an image (both header copies) and fixes the
+-# checksums, so only the metadata is wrong.
++# the JSON metadata of an image (both header copies, or for the "newer-"
++# cases only the primary, with the next sequence ID: an interrupted update)
++# and fixes the checksums, so only the metadata is wrong.
+ # Usage: craft_header.py <in image> <out image> <case>
+ 
+ import hashlib
+@@ -19,6 +20,7 @@ text = image[4096:header_size].split(b"\0", 1)[0].decode()
+ j = json.loads(text)
+ raw = None
+ secondary_size = header_size
++only_primary = case.startswith("newer-")
+ slot = j["keyslots"]["0"]
+ area = slot["area"]
+ 
+@@ -47,6 +49,11 @@ elif case == "argon2-lanes":
+         "cpus": (1 << 24) - 1, "salt": slot["kdf"]["salt"]}
+ elif case == "stripes":
+     slot["af"]["stripes"] = 4000000000
++elif case == "newer-unsupported":
++    # valid metadata, but for a feature the reader doesn't have
++    j["config"]["requirements"] = {"mandatory": ["offline-reencrypt"]}
++elif case == "newer-damaged":
++    j["config"]["keyslots_size"] = str(int(j["segments"]["0"]["offset"]))
+ else:
+     sys.exit("unknown case " + case)
+ 
+@@ -58,6 +65,9 @@ assert len(data) < header_size - 4096
+ def write_copy(offset, size_field):
+     copy = image[offset:offset + header_size]
+     copy[8:16] = struct.pack(">Q", size_field)
++    if only_primary:
++        sequence = struct.unpack(">Q", copy[16:24])[0]
++        copy[16:24] = struct.pack(">Q", sequence + 1)
+     copy[4096:header_size] = data + b"\0" * (header_size - 4096 - len(data))
+     copy[448:512] = b"\0" * 64
+     copy[448:480] = hashlib.sha256(bytes(copy)).digest()
+@@ -65,5 +75,6 @@ def write_copy(offset, size_field):
+ 
+ 
+ write_copy(0, header_size)
+-write_copy(header_size, secondary_size)
++if not only_primary:
++    write_copy(header_size, secondary_size)
+ open(target, "wb").write(image)
+diff --git a/src/tests/system/luks2/crash_test.cpp b/src/tests/system/luks2/crash_test.cpp
+new file mode 100644
+index 0000000000..7d79cb073c
+--- /dev/null
++++ b/src/tests/system/luks2/crash_test.cpp
+@@ -0,0 +1,292 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	A crash model for the LUKS2 writer: adds and removes keyslots on a disk
++	in memory that loses power after each of its writes and flushes in
++	turn. Writes not yet flushed may then be lost, kept, or torn (only their
++	first sector kept, or all but it), in every combination. Each state must
++	still open: a header copy holds up, and the passphrase that was there
++	before opens the volume; a keyslot the header lists opens with its
++	passphrase.
++
++	--no-flush leaves the flush hook out: then states that don't open must
++	turn up (the model notices missing flushes).
++*/
++
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <vector>
++
++#include <luks2/luks2.h>
++
++
++static const size_t kDiskSize = 20 * 1024 * 1024;
++static const size_t kSector = 512;
++static const size_t kMaxCombinations = 1 << 16;
++
++static const char* kOld = "old passphrase";
++static const char* kNew = "new passphrase";
++
++
++struct Write {
++	uint64_t				offset;
++	std::vector<uint8_t>	data;
++};
++
++
++struct Disk {
++	std::vector<uint8_t>	durable;
++	std::vector<uint8_t>	visible;
++	std::vector<Write>		pending;
++	long					operationsLeft;
++	long					operations;
++	bool					crashed;
++
++	explicit Disk(const std::vector<uint8_t>& image)
++		:
++		durable(image),
++		visible(image),
++		operationsLeft(-1),
++		operations(0),
++		crashed(false)
++	{
++	}
++
++	bool Step()
++	{
++		if (crashed)
++			return false;
++		operations++;
++		if (operationsLeft == 0) {
++			crashed = true;
++			return false;
++		}
++		if (operationsLeft > 0)
++			operationsLeft--;
++		return true;
++	}
++};
++
++
++static ssize_t
++disk_read(void* cookie, uint64_t offset, void* buffer, size_t size)
++{
++	Disk& disk = *(Disk*)cookie;
++	if (offset > disk.visible.size() || size > disk.visible.size() - offset)
++		return -1;
++	memcpy(buffer, disk.visible.data() + offset, size);
++	return size;
++}
++
++
++static ssize_t
++disk_write(void* cookie, uint64_t offset, const void* buffer, size_t size)
++{
++	Disk& disk = *(Disk*)cookie;
++	if (!disk.Step())
++		return -1;
++	memcpy(disk.visible.data() + offset, buffer, size);
++	Write write;
++	write.offset = offset;
++	write.data.assign((const uint8_t*)buffer, (const uint8_t*)buffer + size);
++	disk.pending.push_back(write);
++	return size;
++}
++
++
++static int
++disk_flush(void* cookie)
++{
++	Disk& disk = *(Disk*)cookie;
++	if (!disk.Step())
++		return -1;
++	disk.durable = disk.visible;
++	disk.pending.clear();
++	return 0;
++}
++
++
++static luks2_device_io
++make_io(Disk& disk, bool flush)
++{
++	luks2_device_io io = { &disk, disk_read, disk_write, kDiskSize,
++		flush ? disk_flush : NULL };
++	return io;
++}
++
++
++static luks2_kdf
++fast_kdf()
++{
++	luks2_kdf kdf;
++	memset(&kdf, 0, sizeof(kdf));
++	kdf.type = LUKS2_KDF_PBKDF2;
++	kdf.hash = LUKS2_HASH_SHA256;
++	kdf.iterations = 1000;
++	return kdf;
++}
++
++
++static bool
++opens(const luks2_volume* volume, const luks2_device_io* io,
++	const char* passphrase, int keyslot)
++{
++	uint8_t key[LUKS2_MAX_KEY_SIZE];
++	size_t keySize;
++	int result = luks2_unlock(volume, io, passphrase, strlen(passphrase),
++		keyslot, key, &keySize, NULL);
++	luks2_wipe(key, sizeof(key));
++	return result == LUKS2_OK;
++}
++
++
++enum Operation { kAdd, kRemove };
++
++
++//! Runs the change on \a disk; the result is ignored (it may crash).
++static void
++run(Operation operation, Disk& disk, bool flush)
++{
++	luks2_device_io io = make_io(disk, flush);
++	luks2_volume* volume;
++	if (luks2_read_header(&io, &volume) != LUKS2_OK)
++		return;
++	uint8_t key[LUKS2_MAX_KEY_SIZE];
++	size_t keySize;
++	if (luks2_unlock(volume, &io, kOld, strlen(kOld), -1, key, &keySize,
++			NULL) == LUKS2_OK) {
++		if (operation == kAdd) {
++			luks2_kdf kdf = fast_kdf();
++			luks2_add_keyslot(volume, &io, key, keySize, kNew, strlen(kNew),
++				&kdf, 1, NULL);
++		} else
++			luks2_remove_keyslot(volume, &io, 1);
++	}
++	luks2_wipe(key, sizeof(key));
++	luks2_free_volume(volume);
++}
++
++
++/*!	Checks one state after a crash; returns an error text, or NULL. */
++static const char*
++check_state(Operation operation, std::vector<uint8_t>& image)
++{
++	Disk disk(image);
++	luks2_device_io io = make_io(disk, true);
++	luks2_volume* volume;
++	if (luks2_read_header(&io, &volume) != LUKS2_OK)
++		return "no header copy holds up";
++
++	const char* problem = NULL;
++	if (!opens(volume, &io, kOld, -1))
++		problem = "the old passphrase doesn't open it";
++	else if (operation == kAdd && volume->keyslots[1].used
++		&& !opens(volume, &io, kNew, 1)) {
++		problem = "the header lists the new keyslot, which doesn't open";
++	}
++	luks2_free_volume(volume);
++	return problem;
++}
++
++
++/*!	All crash points of \a operation on \a base; returns the number of
++	states that don't open. */
++static long
++test(Operation operation, const std::vector<uint8_t>& base, bool flush,
++	long& statesChecked)
++{
++	// a run without a crash counts the steps
++	Disk clean(base);
++	run(operation, clean, flush);
++	long steps = clean.operations;
++
++	long failures = 0;
++	for (long crashAt = 0; crashAt <= steps; crashAt++) {
++		Disk disk(base);
++		disk.operationsLeft = crashAt;
++		run(operation, disk, flush);
++
++		// every fate of every unflushed write: lost, kept, first sector
++		// only, all but the first sector
++		size_t count = disk.pending.size();
++		size_t combinations = 1;
++		for (size_t i = 0; i < count && combinations < kMaxCombinations; i++)
++			combinations *= 4;
++		if (combinations > kMaxCombinations)
++			combinations = kMaxCombinations;
++		for (size_t combination = 0; combination < combinations;
++				combination++) {
++			std::vector<uint8_t> image = disk.durable;
++			size_t fates = combination;
++			for (size_t i = 0; i < count; i++) {
++				const Write& write = disk.pending[i];
++				int fate = fates % 4;
++				fates /= 4;
++				size_t size = write.data.size();
++				size_t first = size < kSector ? size : kSector;
++				if (fate == 1)
++					memcpy(&image[write.offset], write.data.data(), size);
++				else if (fate == 2)
++					memcpy(&image[write.offset], write.data.data(), first);
++				else if (fate == 3) {
++					memcpy(&image[write.offset + first],
++						write.data.data() + first, size - first);
++				}
++			}
++			statesChecked++;
++			const char* problem = check_state(operation, image);
++			if (problem != NULL) {
++				if (failures < 5) {
++					printf("%s, crash after step %ld of %ld, %zu unflushed "
++						"writes (fates %zu): %s\n",
++						operation == kAdd ? "add" : "remove", crashAt, steps,
++						count, combination, problem);
++				}
++				failures++;
++			}
++		}
++	}
++	return failures;
++}
++
++
++int
++main(int argc, char** argv)
++{
++	bool flush = !(argc > 1 && strcmp(argv[1], "--no-flush") == 0);
++
++	// a volume with keyslot 0
++	std::vector<uint8_t> base(kDiskSize, 0);
++	Disk formatDisk(base);
++	luks2_device_io io = make_io(formatDisk, true);
++	luks2_format_parameters parameters;
++	memset(&parameters, 0, sizeof(parameters));
++	parameters.sector_size = 512;
++	parameters.key_size = 64;
++	parameters.digest_iterations = 1000;
++	parameters.kdf = fast_kdf();
++	if (luks2_format(&io, &parameters, kOld, strlen(kOld), NULL, NULL)
++			!= LUKS2_OK) {
++		printf("format failed\n");
++		return 2;
++	}
++	std::vector<uint8_t> oneSlot = formatDisk.visible;
++
++	// the same with keyslot 1 too, for the removal
++	Disk addDisk(oneSlot);
++	run(kAdd, addDisk, true);
++	std::vector<uint8_t> twoSlots = addDisk.visible;
++
++	long states = 0;
++	long failures = test(kAdd, oneSlot, flush, states);
++	failures += test(kRemove, twoSlots, flush, states);
++	printf("%ld crash states, %ld don't open%s\n", states, failures,
++		flush ? "" : " (without flushes)");
++	return failures == 0 ? 0 : 1;
++}
+diff --git a/src/tests/system/luks2/cryptsetup_test.sh b/src/tests/system/luks2/cryptsetup_test.sh
+index 4950add530..2d594a4872 100755
+--- a/src/tests/system/luks2/cryptsetup_test.sh
++++ b/src/tests/system/luks2/cryptsetup_test.sh
+@@ -282,5 +282,146 @@ else
+ 	ok "cryptsetup no longer lists our removed keyslot"
+ fi
+ 
++echo "== the correctness review of 2026-11-11"
++
++# an interrupted update: the newer primary asks for a feature we don't have;
++# the older secondary must not be used instead, nor written over the primary
++python3 -I "$HERE/craft_header.py" cs-base.img newer.img newer-unsupported
++before=$(md5sum < newer.img)
++expect_refused "a newer unsupported header isn't replaced by the older copy" \
++	newer.img k0 "doesn't support"
++if "$LUKS" addkey -k k0 --new-key-file k1 --pbkdf pbkdf2 --iterations 1000 \
++		newer.img >/dev/null 2>&1; then
++	bad "addkey wrote over the newer unsupported header"
++elif [ "$(md5sum < newer.img)" = "$before" ]; then
++	ok "addkey leaves the volume with the newer unsupported header alone"
++else
++	bad "addkey refused, but changed the image"
++fi
++if cs luksDump --dump-json-metadata newer.img | grep -q offline-reencrypt; then
++	ok "cryptsetup still sees the newer header's requirement"
++else
++	bad "the newer header's requirement is gone"
++fi
++
++# the newer copy's metadata is damaged: the older one is used, and the next
++# change repairs both
++python3 -I "$HERE/craft_header.py" cs-base.img newer.img newer-damaged
++if "$LUKS" dump newer.img | grep -q "(secondary copy), PRIMARY DAMAGED, secondary ok"; then
++	ok "a newer copy with damaged metadata: the secondary is used and named"
++else
++	bad "newer-damaged dump: $("$LUKS" dump newer.img 2>&1 | grep header)"
++fi
++expect_open "opened from the older secondary copy" newer.img k0 0
++"$LUKS" addkey -k k0 --new-key-file k1 --pbkdf pbkdf2 --iterations 1000 \
++	newer.img >/dev/null 2>&1
++if "$LUKS" dump newer.img | grep -q "(primary copy), primary ok, secondary ok" \
++	&& cs luksDump newer.img >/dev/null 2>&1; then
++	ok "the next change rewrote both copies"
++else
++	bad "both copies after addkey: $("$LUKS" dump newer.img 2>&1 | grep header)"
++fi
++cs_opens "cryptsetup opens the repaired volume's new keyslot" newer.img k1 1
++
++# an unbound keyslot (another key) doesn't count as a way into the data
++image unbound.img 40M
++cs luksFormat --type luks2 --key-file k0 --pbkdf pbkdf2 \
++	--pbkdf-force-iterations 1000 unbound.img
++cs luksAddKey --unbound --key-size 512 --pbkdf pbkdf2 \
++	--pbkdf-force-iterations 1000 unbound.img k1
++	# (cryptsetup picks the slot)
++unboundSlot=$("$LUKS" dump unbound.img \
++	| sed -n 's/^  keyslot *\([0-9]*\):.*unbound.*/\1/p')
++if [ -n "$unboundSlot" ] \
++	&& cs luksDump unbound.img | grep -q "^  $unboundSlot: luks2 (unbound)"; then
++	ok "dump marks the unbound keyslot $unboundSlot, as cryptsetup does"
++else
++	bad "dump doesn't mark the unbound keyslot"
++fi
++out=$("$LUKS" removekey -k k0 unbound.img 0 2>&1)
++if [ $? -ne 0 ] && echo "$out" | grep -q "last one"; then
++	ok "the last bound keyslot isn't removed for an unbound one"
++else
++	bad "removekey 0 with an unbound slot: $out"
++fi
++expect_open "slot 0 still opens it" unbound.img k0 0
++out=$("$LUKS" removekey -k k0 unbound.img $unboundSlot 2>&1) \
++	&& ok "the unbound keyslot itself can be removed" \
++	|| bad "removing the unbound keyslot: $out"
++
++# two changes at the same time: the second waits for nobody, it's refused
++image race.img 40M
++"$LUKS" format -y -k k0 --pbkdf pbkdf2 --iterations 1000 race.img >/dev/null
++"$LUKS" addkey -k k0 --new-key-file k1 --pbkdf pbkdf2 --iterations 1000 \
++	race.img >/dev/null
++rm -f gate
++mkfifo gate
++"$LUKS" removekey -k gate race.img 1 > first.out 2>&1 &
++first=$!
++exec 3>gate
++	# returns when the first one opens its key file: it holds the lock
++out=$("$LUKS" removekey -k k0 race.img 0 2>&1)
++second=$?
++cat k1 >&3
++exec 3>&-
++wait $first
++firstStatus=$?
++if [ $second -ne 0 ] && echo "$out" | grep -q "another program"; then
++	ok "a second luks command on a locked volume is refused"
++else
++	bad "the second removekey: $out"
++fi
++[ $firstStatus -eq 0 ] && ok "the first one finished ($(cat first.out))" \
++	|| bad "the first removekey: $(cat first.out)"
++expect_open "the volume still opens with slot 0" race.img k0 0
++
++# cryptsetup changes the header while luks waits for a passphrase: luks
++# notices before writing
++"$LUKS" addkey -k gate --new-key-file k2 --pbkdf pbkdf2 --iterations 1000 \
++	race.img > first.out 2>&1 &
++first=$!
++exec 3>gate
++cs luksAddKey --key-file k0 --new-key-slot 5 --pbkdf pbkdf2 \
++	--pbkdf-force-iterations 1000 race.img k1
++cat k0 >&3
++exec 3>&-
++wait $first
++firstStatus=$?
++if [ $firstStatus -ne 0 ] && grep -q "changed by another program" first.out; then
++	ok "a header changed meanwhile is noticed ($(cat first.out))"
++else
++	bad "addkey after cryptsetup's change: $(cat first.out)"
++fi
++cs_opens "cryptsetup's keyslot 5 survived" race.img k1 5
++expect_open "slot 0 survived" race.img k0 0
++rm -f gate
++
++# luks write: all of the file or nothing
++image write.img 32M
++"$LUKS" format -y -k k0 --pbkdf pbkdf2 --iterations 1000 write.img >/dev/null
++before=$(md5sum < write.img)
++head -c $((16 * 1024 * 1024 + 512)) plain64.img > big.img
++head -c $((1024 * 1024 + 100)) plain64.img > odd.img
++for file in big.img odd.img; do
++	out=$("$LUKS" write -k k0 write.img $file 2>&1)
++	if [ $? -ne 0 ] && [ "$(md5sum < write.img)" = "$before" ]; then
++		ok "luks write refuses $file, the volume unchanged ($out)"
++	else
++		bad "luks write $file: $out"
++	fi
++done
++
++# crashes during keyslot changes: one header copy always holds up
++if "$(dirname "$LUKS")/crash_test" > crash.out 2>&1; then
++	ok "crash model: $(tail -1 crash.out)"
++else
++	bad "crash model: $(tail -3 crash.out)"
++fi
++if "$(dirname "$LUKS")/crash_test" --no-flush > crash.out 2>&1; then
++	bad "the crash model doesn't notice missing flushes"
++else
++	ok "the crash model notices missing flushes ($(tail -1 crash.out))"
++fi
++
+ echo "$passed passed, $failed failed"
+ [ $failed -eq 0 ]
+diff --git a/src/tests/system/luks2/qemu/guest-driver-test.sh b/src/tests/system/luks2/qemu/guest-driver-test.sh
+index 5172f3e6ef..68e6c4ba62 100755
+--- a/src/tests/system/luks2/qemu/guest-driver-test.sh
++++ b/src/tests/system/luks2/qemu/guest-driver-test.sh
+@@ -44,9 +44,15 @@ for raw in /dev/disk/nvme/*/raw; do
+ 	if [ "$(head -c 14 "$raw" 2>/dev/null)" = "LUKSTEST-BLANK" ]; then
+ 		BLANK=$raw
+ 	fi
++	part=$(dirname "$raw")/0
++	if [ "$(head -c 15 "$part" 2>/dev/null)" = "LUKSTEST-PARTED" ]; then
++		PARTED=$raw
++		PARTED_PART=$part
++	fi
+ done
+-log "disks: csdata=$CSDATA cswrite=$CSWRITE blank=$BLANK"
+-[ -n "$CSDATA" ] && [ -n "$CSWRITE" ] && [ -n "$BLANK" ] || bad "test disks"
++log "disks: csdata=$CSDATA cswrite=$CSWRITE blank=$BLANK parted=$PARTED"
++[ -n "$CSDATA" ] && [ -n "$CSWRITE" ] && [ -n "$BLANK" ] && [ -n "$PARTED" ] \
++	|| bad "test disks"
+ 
+ log "== 1. a volume encrypted by cryptsetup"
+ run luks dump "$CSDATA"
+@@ -194,6 +200,65 @@ run luks list
+ dd if="$dev" of=/dev/null bs=1048576 2>&1 | while read -r line; do log "   | $line"; done
+ run luks close "$dev"
+ 
++log "== 7. the checks from the correctness review"
++# a disk with partitions isn't formatted as a whole; its partition may be
++before=$(head -c 1048576 "$PARTED" | sha256sum)
++if run luks format -y -k $T/key-wrong --pbkdf pbkdf2 --iterations 1000 \
++		"$PARTED"; then
++	bad "formatted a disk that has partitions"
++elif [ "$(head -c 1048576 "$PARTED" | sha256sum)" = "$before" ]; then
++	ok "a disk with partitions isn't formatted, nothing written"
++else
++	bad "format refused, but the disk changed"
++fi
++run luks format -y -k $T/key-wrong --pbkdf pbkdf2 --iterations 1000 \
++	"$PARTED_PART" && ok "its partition can be formatted" \
++	|| bad "formatting the partition"
++
++# an open volume and its mounted file system aren't overwritten
++dev=$(luks open -k $T/key-second "$BLANK" 2>&1) && ok "open: $dev" \
++	|| bad "open: $dev"
++mp=""
++for i in $(seq 1 20); do
++	mp=$(mount_point_of "$dev") && break
++	sleep 1
++done
++[ -n "$mp" ] && ok "mounted at $mp" || bad "not mounted"
++before=$(head -c 4194304 "$BLANK" | sha256sum)
++run luks format -y -k $T/key-wrong --pbkdf pbkdf2 --iterations 1000 "$dev" \
++	&& bad "formatted a mounted device" || ok "a mounted device isn't formatted"
++run luks format -y -k $T/key-wrong --pbkdf pbkdf2 --iterations 1000 \
++	"$BLANK" && bad "formatted an open volume" \
++	|| ok "an open volume isn't formatted"
++run luks write -k $T/key-second "$BLANK" $T/pattern.bin \
++	&& bad "wrote over an open volume's data" \
++	|| ok "an open volume's data area isn't written"
++[ "$(head -c 4194304 "$BLANK" | sha256sum)" = "$before" ] \
++	&& ok "the open volume's header is unchanged" || bad "the header changed"
++[ -n "$mp" ] && run unmount "$mp"
++run luks close "$dev" || bad "close"
++
++# two luks commands on one volume: the second is refused (the lock on a
++# devfs device)
++rm -f /tmp/gate
++mkfifo /tmp/gate
++luks addkey -k /tmp/gate --new-key-file $T/key-wrong --pbkdf pbkdf2 \
++	--iterations 1000 "$BLANK" > /tmp/first.out 2>&1 &
++first=$!
++exec 3>/tmp/gate
++if run luks removekey -k $T/key-second "$BLANK"; then
++	bad "a second luks command changed a locked volume"
++else
++	ok "a second luks command on a locked volume is refused"
++fi
++cat $T/key-second >&3
++exec 3>&-
++wait $first && ok "the first one finished: $(cat /tmp/first.out)" \
++	|| bad "the first one: $(cat /tmp/first.out)"
++run luks removekey -k $T/key-wrong "$BLANK" && ok "its keyslot removed again" \
++	|| bad "removing the added keyslot"
++run luks dump "$BLANK"
++
+ log "done: $passed passed, $failed failed"
+ sync
+ shutdown -q
+diff --git a/src/tests/system/luks2/qemu/guest-ui-test.sh b/src/tests/system/luks2/qemu/guest-ui-test.sh
+index 95bdaaee29..fdad86b3ed 100755
+--- a/src/tests/system/luks2/qemu/guest-ui-test.sh
++++ b/src/tests/system/luks2/qemu/guest-ui-test.sh
+@@ -9,7 +9,10 @@
+ #  3. Tracker's "Unlock" message: EncryptedVolume, a wrong passphrase, the
+ #     right one: mounted again, the files intact
+ #  4. EncryptedVolume --lock (DriveSetup's Lock)
+-#  5. partition 2 of a GPT disk encrypted, Installer installs onto it, and
++#  5. the checks from the correctness review: passphrases over 512 bytes
++#     are refused, not cut; a volume unlocked while the Encrypt window is
++#     open isn't overwritten; --encrypt on a mounted device is refused
++#  6. partition 2 of a GPT disk encrypted, Installer installs onto it, and
+ #     installs the EFI loader onto the disk's ESP
+ # Usage: guest-ui-test.sh <test files dir>
+ 
+@@ -93,7 +96,60 @@ echo "== 4. EncryptedVolume --lock (DriveSetup's Lock)"
+ EncryptedVolume --lock "$BLANK" && luks list | grep -q "No open" \
+ 	&& [ ! -d /Secret ] && ok "locked" || bad "lock: $(luks list)"
+ 
+-echo "== 5. Installer onto an encrypted partition, EFI loader onto the ESP"
++echo "== 5. the checks from the correctness review"
++long=$(printf '%0513d' 0)
++EncryptedVolume --encrypt "$BLANK" > /tmp/ev3.log 2>&1 &
++wait_window EncryptedVolume Encrypt || bad "no Encrypt window"
++hey EncryptedVolume set Value of View passphrase of Window 0 to "\"$long\"" > /dev/null
++hey EncryptedVolume set Value of View repeat of Window 0 to "\"$long\"" > /dev/null
++status=$(hey EncryptedVolume get Text of View status of Window 0 | result result)
++[ "$(hey EncryptedVolume get Enabled of View ok of Window 0 | result result)" = FALSE ] \
++	&& echo "$status" | grep -q "longer than 512" \
++	&& ok "a 513-byte passphrase: Encrypt disabled, $status" \
++	|| bad "513 bytes: status $status"
++before=$(head -c 4194304 "$BLANK" | sha256sum)
++reply=$(hey EncryptedVolume encr of Window 0)
++echo "$reply" | grep -q "too long" && ok "the script request is refused too" \
++	|| bad "513 bytes, encr: $reply"
++long=$(printf '%0512d' 0)
++hey EncryptedVolume set Value of View passphrase of Window 0 to "\"$long\"" > /dev/null
++hey EncryptedVolume set Value of View repeat of Window 0 to "\"$long\"" > /dev/null
++[ "$(hey EncryptedVolume get Enabled of View ok of Window 0 | result result)" = TRUE ] \
++	&& ok "512 bytes are accepted" || bad "512 bytes"
++# unlocked while the window is open: then it's refused, nothing written
++printf 'first passphrase' > /tmp/key-first
++dev=$(luks open -k /tmp/key-first "$BLANK") && ok "unlocked meanwhile: $dev" \
++	|| bad "luks open: $dev"
++reply=$(hey EncryptedVolume encr of Window 0)
++echo "$reply" | grep -q "lock it first" \
++	&& ok "Encrypt refused: $(echo "$reply" | result error)" \
++	|| bad "encrypt an unlocked volume: $reply"
++[ "$(head -c 4194304 "$BLANK" | sha256sum)" = "$before" ] \
++	&& ok "nothing written to it" || bad "the volume changed"
++hey EncryptedVolume quit > /dev/null 2>&1
++# --encrypt on the mounted decrypted device: an alert, nothing written
++for i in $(seq 1 20); do
++	[ -d /Secret ] && break
++	sleep 1
++done
++[ -d /Secret ] && ok "mount_server mounted it" || bad "/Secret not mounted"
++before=$(head -c 1048576 "$dev" | sha256sum)
++EncryptedVolume --encrypt "$dev" > /tmp/ev4.log 2>&1 &
++if wait_window EncryptedVolume "Encrypted volume"; then
++	text=$(hey EncryptedVolume get Text [0 to 400] of View _tv_ of Window 0 | result result)
++	echo "$text" | grep -q "mounted" && ok "--encrypt on a mounted device: $text" \
++		|| bad "alert text $text"
++	hey EncryptedVolume ALTB of Window 0 with which="int32(0)" > /dev/null
++else
++	bad "no alert for a mounted device"
++fi
++[ "$(head -c 1048576 "$dev" | sha256sum)" = "$before" ] \
++	&& [ -f /Secret/note.txt ] && ok "the mounted volume is untouched" \
++	|| bad "the mounted volume changed"
++EncryptedVolume --lock "$BLANK" && luks list | grep -q "No open" \
++	&& ok "locked again" || bad "lock: $(luks list)"
++
++echo "== 6. Installer onto an encrypted partition, EFI loader onto the ESP"
+ EncryptedVolume --encrypt "$TARGET/1" > /tmp/ev2.log 2>&1 &
+ wait_window EncryptedVolume Encrypt || bad "no Encrypt window"
+ hey EncryptedVolume set Value of View name of Window 0 to '"HaikuLUKS"' > /dev/null
+diff --git a/src/tests/system/luks2/qemu/run-boot-test.sh b/src/tests/system/luks2/qemu/run-boot-test.sh
+index 3cd454a662..e810d7dfac 100755
+--- a/src/tests/system/luks2/qemu/run-boot-test.sh
++++ b/src/tests/system/luks2/qemu/run-boot-test.sh
+@@ -17,7 +17,11 @@
+ #  - boot 3: Esc at the prompt, then "Unlock encrypted volume" in the boot
+ #    menu, and "Continue booting";
+ #  - boot 4: with the passphrase of a keyslot cryptsetup added (argon2id,
+-#    512 MiB, 4 lanes: four 128 MiB allocations in the boot loader).
++#    512 MiB, 4 lanes: four 128 MiB allocations in the boot loader);
++#  - boot 5: the primary header's UUID damaged (its checksum fails): the
++#    loader and the kernel must both use the secondary copy;
++#  - boot 6: the primary's magic damaged too: the loader must find the
++#    volume by its secondary header.
+ # Then the build host decrypts the volume and checks what Haiku wrote.
+ #
+ # Usage: run-boot-test.sh <anyboot image> <haiku_loader.efi> <work dir>
+@@ -206,6 +210,36 @@ grep -a -q 'opened with keyslot 5' serial-fourth.log \
+ 	&& ok "the boot loader opened cryptsetup's 512 MiB argon2id keyslot" \
+ 	|| bad "keyslot 5"
+ 
++luksByte=$(( (2048 + espSectors) * 512 ))
++damage() {
++	# damage <byte offset in the LUKS2 partition> <character>
++	printf '%s' "$2" | dd of=disk.img bs=1 seek=$((luksByte + $1)) \
++		conv=notrunc 2>/dev/null
++}
++header_state() {
++	dd if=disk.img of=luks-head.img bs=1M skip=$((luksByte / 1048576)) \
++		count=$((luksSize / 1048576)) 2>/dev/null
++	"$LUKS" dump luks-head.img 2>&1 | grep header
++	rm -f luks-head.img
++}
++
++echo "== boot 5: the primary UUID damaged, the secondary header used"
++damage 168 Z
++header_state
++KEYFILE=key
++boot fifth max
++grep -a -q "vfs_boot: encrypted boot volume .* opened as" serial-fifth.log \
++	&& ok "the kernel found the volume by the secondary header's UUID" \
++	|| bad "the kernel didn't open the volume"
++
++echo "== boot 6: the primary magic damaged too"
++damage 0 X
++header_state
++boot sixth max
++grep -a -q "luks: locked LUKS2 volume" serial-sixth.log \
++	&& ok "the boot loader found the volume by its secondary header" \
++	|| bad "the boot loader didn't find the volume"
++
+ echo "== what Haiku wrote, read back on the build host"
+ dd if=disk.img of=luks-back.img bs=1M skip=$(( (2048 + espSectors) * 512 / 1048576 )) \
+ 	count=$((luksSize / 1048576)) 2>/dev/null
+@@ -216,11 +250,11 @@ printf '%s\n' "cp /myfs/home/luks-random.bin :$W/random-back.bin" \
+ 	"cp /myfs/home/luks-boot-marker :$W/marker-back" "quit" \
+ 	| "$BFS" system-back.bfs > bfs_shell-back.log 2>&1 || true
+ if [ "$(sha256sum random-back.bin | cut -d' ' -f1)" = "$(cat random-back.sha256)" ]; then
+-	ok "the 16 MiB file written at boot 4 reads back identical"
++	ok "the 16 MiB file written at boot 6 reads back identical"
+ else
+ 	bad "luks-random.bin"
+ fi
+-[ "$(cat marker-back)" = "written at boot 4" ] && ok "marker of boot 4" \
++[ "$(cat marker-back)" = "written at boot 6" ] && ok "marker of boot 6" \
+ 	|| bad "marker: $(cat marker-back)"
+ 
+ echo "$passed passed, $failed failed"
+diff --git a/src/tests/system/luks2/qemu/run-driver-test.sh b/src/tests/system/luks2/qemu/run-driver-test.sh
+index b2cfa8c273..f14e4d0d10 100755
+--- a/src/tests/system/luks2/qemu/run-driver-test.sh
++++ b/src/tests/system/luks2/qemu/run-driver-test.sh
+@@ -10,7 +10,9 @@
+ #    and OpenSSL must decrypt what Haiku wrote (also a partial sector);
+ #  - blank: Haiku formats it, puts BFS on it, writes files, reopens and
+ #    checks them; then the build host reads them back through the host luks
+-#    tool and bfs_shell, and cryptsetup must open the passphrase Haiku added.
++#    tool and bfs_shell, and cryptsetup must open the passphrase Haiku added;
++#  - parted: a GPT disk with one partition: luks must refuse to format the
++#    disk, and may format the partition.
+ #
+ # Usage: run-driver-test.sh <anyboot image> <work dir> <cryptsetup> <host luks>
+ #            <bfs_shell> [timeout seconds]
+@@ -62,6 +64,12 @@ rm -f blank.img
+ truncate -s 256M blank.img
+ printf 'LUKSTEST-BLANK' | dd of=blank.img conv=notrunc 2>/dev/null
+ 
++rm -f parted.img
++truncate -s 64M parted.img
++sgdisk -n 1:2048:+40M -t 1:8300 parted.img > /dev/null
++printf 'LUKSTEST-PARTED' | dd of=parted.img bs=512 seek=2048 conv=notrunc \
++	2>/dev/null
++
+ echo "== putting the guest test into the image"
+ cat > luks-test.job <<'JOB'
+ job x-vnd.luks-test {
+@@ -104,6 +112,8 @@ timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu max -smp 4 -m 3072 \
+ 	-device nvme,drive=d2,serial=cswrite \
+ 	-drive if=none,id=d3,file=blank.img,format=raw \
+ 	-device nvme,drive=d3,serial=blank \
++	-drive if=none,id=d4,file=parted.img,format=raw \
++	-device nvme,drive=d4,serial=parted \
+ 	-nic none -display none -serial file:serial.log -no-reboot \
+ 	> qemu.log 2>&1 || echo "QEMU exited with $?"
+ echo "QEMU ran $(( $(date +%s) - start )) s"
+@@ -151,6 +161,14 @@ fi
+ grep -q "written on Haiku" note-back.txt 2>/dev/null && ok "note.txt" \
+ 	|| bad "note.txt"
+ 
++if sgdisk -v parted.img | grep -q "No problems found" \
++	&& dd if=parted.img bs=512 skip=2048 count=1 2>/dev/null | head -c 4 \
++		| grep -q LUKS; then
++	ok "the GPT is intact; its partition holds the LUKS2 volume Haiku made"
++else
++	bad "parted.img: $(sgdisk -v parted.img | tail -2)"
++fi
++
+ guestFailed=$(grep -c "LUKSTEST FAIL" serial.log || true)
+ grep -q "LUKSTEST done" serial.log || { bad "the guest test didn't finish"; }
+ echo "host: $passed passed, $failed failed; guest failures: $guestFailed"

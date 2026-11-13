@@ -1,0 +1,747 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 11:39:52 -0500
+Subject: [PATCH 08/15] efi loader: boot the disk the loader came from; grow
+ the heap
+
+Started from a USB stick on a laptop whose NVMe disk holds
+an installed Haiku, the stick's EFI loader booted the NVMe's system, and
+its boot menu didn't list the stick.
+
+- platform_add_boot_device() added the firmware's disks in the
+  firmware's order, which lists the built-in disk first, and the first
+  Haiku volume found is booted. Now the disk whose device path starts
+  the device path of what the firmware loaded the loader from (its
+  ESP partition, or the El Torito image OVMF boots a hybrid anyboot
+  image through) goes first, behind a network disk. A disk
+  without a system still falls through to the next. Every disk is
+  logged ("efi: disk 1: 808 MiB, 512-byte blocks, the boot loader's").
+- The boot menu mounts the system package of each volume it lists. The
+  1.5 MiB heap had about 770 KB in use when the menu started (mostly
+  the boot volume's package), its 152 old states took about 50 KB, and
+  it ran out on the stick's
+  (packagefs.cpp:859: Out of memory). With BOOT_SUPPORT_HEAP_GROWTH (EFI
+  only), malloc() adds another region of the default size when the heap
+  runs out, up to 8. Other platforms keep a single region.
+
+New test qemu/run-loader-disk-test.sh: an internal NVMe disk listed
+first (raw BFS, the image's system package, 152 old states) and the
+stick; the loader must boot the stick, the menu must list both, and
+started from an ESP-only disk the loader boots the internal disk and
+still lists the stick. 8 of 8 with the new loader; the old one fails.
+The arm64 compile check covers heap.cpp and devices.cpp.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/boot/loader/Jamfile                |   4 +
+ src/system/boot/loader/heap.cpp               |  79 ++++++--
+ src/system/boot/platform/efi/devices.cpp      |  91 ++++++++-
+ src/tests/system/luks2/README.md              |  14 +-
+ src/tests/system/luks2/arm64_compile_check.sh |  12 +-
+ src/tests/system/luks2/qemu/anyboot_layout.py |  51 +++++
+ src/tests/system/luks2/qemu/loader_console.py |  86 ++++++++
+ .../system/luks2/qemu/run-loader-disk-test.sh | 185 ++++++++++++++++++
+ 8 files changed, 501 insertions(+), 21 deletions(-)
+ create mode 100755 src/tests/system/luks2/qemu/anyboot_layout.py
+ create mode 100755 src/tests/system/luks2/qemu/loader_console.py
+ create mode 100755 src/tests/system/luks2/qemu/run-loader-disk-test.sh
+
+diff --git a/src/system/boot/loader/Jamfile b/src/system/boot/loader/Jamfile
+index 1a247a8b49..3dc030cf22 100644
+--- a/src/system/boot/loader/Jamfile
++++ b/src/system/boot/loader/Jamfile
+@@ -39,6 +39,10 @@ for platform in [ MultiBootSubDirSetup ] {
+ 					# LUKS2 encrypted volumes (luks.cpp): the EFI loaders of
+ 					# all architectures
+ 					BOOT_SUPPORT_LUKS
++
++					# heap.cpp: another region when the heap runs out (the
++					# firmware has memory to spare)
++					BOOT_SUPPORT_HEAP_GROWTH
+ 				;
+ 			}
+ 
+diff --git a/src/system/boot/loader/heap.cpp b/src/system/boot/loader/heap.cpp
+index 043be1395e..c55cca2088 100644
+--- a/src/system/boot/loader/heap.cpp
++++ b/src/system/boot/loader/heap.cpp
+@@ -120,13 +120,57 @@ struct LargeAllocationHashDefinition {
+ typedef BOpenHashTable<LargeAllocationHashDefinition> LargeAllocationHashTable;
+ 
+ 
+-static void* sHeapBase;
+-static void* sHeapEnd;
++#ifdef BOOT_SUPPORT_HEAP_GROWTH
++static const int32 kMaxHeapRegions = 8;
++	// when the heap runs out, another region of kDefaultHeapSize is added
++#else
++static const int32 kMaxHeapRegions = 1;
++#endif
++
++struct HeapRegion {
++	void*	base;
++	size_t	size;
++};
++
++static HeapRegion sHeapRegions[kMaxHeapRegions];
++static int32 sHeapRegionCount;
+ static SimpleAllocator<kAlignment> sAllocator;
+ 
+ static LargeAllocationHashTable sLargeAllocations;
+ 
+ 
++static bool
++is_heap_address(void* address)
++{
++	for (int32 i = 0; i < sHeapRegionCount; i++) {
++		if (address >= sHeapRegions[i].base
++			&& address < (uint8*)sHeapRegions[i].base + sHeapRegions[i].size) {
++			return true;
++		}
++	}
++	return false;
++}
++
++
++static status_t
++add_heap_region(size_t size)
++{
++	if (sHeapRegionCount >= kMaxHeapRegions)
++		return B_NO_MEMORY;
++
++	void* base;
++	ssize_t actualSize = platform_allocate_heap_region(size, &base);
++	if (actualSize < 0)
++		return B_NO_MEMORY;
++
++	sHeapRegions[sHeapRegionCount].base = base;
++	sHeapRegions[sHeapRegionCount].size = actualSize;
++	sHeapRegionCount++;
++	sAllocator.AddChunk(base, actualSize);
++	return B_OK;
++}
++
++
+ static void*
+ malloc_large(size_t size)
+ {
+@@ -176,9 +220,10 @@ heap_release()
+ 		allocation = next;
+ 	}
+ 
+-	platform_free_heap_region(sHeapBase, (addr_t)sHeapEnd - (addr_t)sHeapBase);
++	for (int32 i = 0; i < sHeapRegionCount; i++)
++		platform_free_heap_region(sHeapRegions[i].base, sHeapRegions[i].size);
+ 
+-	sHeapBase = sHeapEnd = NULL;
++	sHeapRegionCount = 0;
+ 	memset((void*)&sAllocator, 0, sizeof(sAllocator));
+ 	memset((void*)&sLargeAllocations, 0, sizeof(sLargeAllocations));
+ }
+@@ -200,16 +245,9 @@ heap_init(stage2_args* args)
+ 	if (args->heap_size == 0)
+ 		args->heap_size = kDefaultHeapSize;
+ 
+-	void* base;
+-	ssize_t size = platform_allocate_heap_region(args->heap_size, &base);
+-	if (size < 0)
++	if (add_heap_region(args->heap_size) != B_OK)
+ 		return B_ERROR;
+ 
+-	sHeapBase = base;
+-	sHeapEnd = (void*)((addr_t)base + size);
+-
+-	sAllocator.AddChunk(sHeapBase, size);
+-
+ 	if (sLargeAllocations.Init(64) != B_OK)
+ 		return B_NO_MEMORY;
+ 
+@@ -227,13 +265,24 @@ heap_available()
+ void*
+ malloc(size_t size)
+ {
+-	if (sHeapBase == NULL)
++	if (sHeapRegionCount == 0)
+ 		return NULL;
+ 
+ 	if (size >= kLargeAllocationThreshold)
+ 		return malloc_large(size);
+ 
+ 	void* allocated = sAllocator.Allocate(size);
++#ifdef BOOT_SUPPORT_HEAP_GROWTH
++	if (allocated == NULL && size != 0
++		&& add_heap_region(kDefaultHeapSize) == B_OK) {
++		// The boot menu mounts the system package of each installed system
++		// it lists, some 700 KB of heap apiece, and their old states add
++		// more: two systems can be too much for one region.
++		dprintf("malloc(): heap region %" B_PRId32 " added\n",
++			sHeapRegionCount);
++		allocated = sAllocator.Allocate(size);
++	}
++#endif
+ 	if (allocated == NULL) {
+ 		if (size == 0)
+ 			return allocated;
+@@ -264,7 +313,7 @@ realloc(void* oldBuffer, size_t newSize)
+ 
+ 	size_t oldSize = 0;
+ 	if (oldBuffer != NULL) {
+-		if (oldBuffer >= sHeapBase && oldBuffer < sHeapEnd) {
++		if (is_heap_address(oldBuffer)) {
+ 			oldSize = sAllocator.UsableSize(oldBuffer);
+ 		} else {
+ 			LargeAllocation* allocation = sLargeAllocations.Lookup(oldBuffer);
+@@ -318,7 +367,7 @@ free(void* allocated)
+ 
+ 	TRACE("free(%p)\n", allocated);
+ 
+-	if (allocated < sHeapBase || allocated >= sHeapEnd) {
++	if (!is_heap_address(allocated)) {
+ 		free_large(allocated);
+ 		return;
+ 	}
+diff --git a/src/system/boot/platform/efi/devices.cpp b/src/system/boot/platform/efi/devices.cpp
+index fe1c1d480a..29b58a14df 100644
+--- a/src/system/boot/platform/efi/devices.cpp
++++ b/src/system/boot/platform/efi/devices.cpp
+@@ -16,6 +16,8 @@
+ 
+ #include "efi_platform.h"
+ #include <efi/protocol/block-io.h>
++#include <efi/protocol/device-path.h>
++#include <efi/protocol/loaded-image.h>
+ 
+ #include "gpt.h"
+ #include "gpt_known_guids.h"
+@@ -30,6 +32,8 @@
+ 
+ 
+ static efi_guid BlockIoGUID = EFI_BLOCK_IO_PROTOCOL_GUID;
++static efi_guid DevicePathGUID = EFI_DEVICE_PATH_PROTOCOL_GUID;
++static efi_guid LoadedImageGUID = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+ 
+ 
+ class EfiDevice : public Node
+@@ -139,6 +143,61 @@ device_contains_partition(EfiDevice *device, boot::Partition *partition)
+ }
+ 
+ 
++static uint16
++device_path_node_length(const efi_device_path_protocol* node)
++{
++	// device path nodes needn't be aligned
++	uint16 length;
++	memcpy(&length, &node->Length, sizeof(length));
++	return length;
++}
++
++
++/*!	Whether \a disk's device path is the start of \a path, or all of it:
++	then \a path names the disk, or a partition (or an El Torito image) on
++	it. */
++static bool
++device_path_starts_with(const efi_device_path_protocol* path,
++	const efi_device_path_protocol* disk)
++{
++	int32 nodes = 0;
++	while (disk->Type != DEVICE_PATH_END) {
++		uint16 length = device_path_node_length(disk);
++		if (length < sizeof(efi_device_path_protocol) || ++nodes > 64
++			|| path->Type == DEVICE_PATH_END
++			|| device_path_node_length(path) != length
++			|| memcmp(path, disk, length) != 0) {
++			return false;
++		}
++		path = (const efi_device_path_protocol*)((const uint8*)path + length);
++		disk = (const efi_device_path_protocol*)((const uint8*)disk + length);
++	}
++	return nodes > 0;
++}
++
++
++/*!	The device path of what the firmware loaded the boot loader from: a
++	partition (the ESP), or an El Torito image when it booted a hybrid
++	anyboot image the way it boots a CD. NULL if the firmware doesn't say. */
++static const efi_device_path_protocol*
++boot_loader_device_path()
++{
++	efi_loaded_image_protocol* loadedImage;
++	if (kBootServices->HandleProtocol(kImage, &LoadedImageGUID,
++			(void**)&loadedImage) != EFI_SUCCESS
++		|| loadedImage->DeviceHandle == NULL) {
++		return NULL;
++	}
++
++	efi_device_path_protocol* path;
++	if (kBootServices->HandleProtocol(loadedImage->DeviceHandle,
++			&DevicePathGUID, (void**)&path) != EFI_SUCCESS) {
++		return NULL;
++	}
++	return path;
++}
++
++
+ status_t
+ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
+ {
+@@ -150,17 +209,22 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
+ 	// If the bootloader was started from the network (net_stack_init will find
+ 	// the ip= parameter in the LoadOptions), add network booting as the first
+ 	// entry if available
++	RemoteDisk* remoteDisk = NULL;
+ 	status_t error = net_stack_init();
+ 	if (error != B_OK) {
+ 		TRACE("Can't init network...\n");
+ 	} else {
+ 		TRACE("Network is initialized! Search for remote disk...\n");
+-		RemoteDisk *remoteDisk = RemoteDisk::FindAnyRemoteDisk();
++		remoteDisk = RemoteDisk::FindAnyRemoteDisk();
+ 		if (remoteDisk != NULL) {
+ 			devicesList->Add(remoteDisk);
+ 		}
+ 	}
+ 
++	const efi_device_path_protocol* loaderPath = boot_loader_device_path();
++	EfiDevice* loaderDisk = NULL;
++	int32 diskCount = 0;
++
+ 	// Read to zero sized buffer to get memory needed for handles
+ 	if (kBootServices->LocateHandle(ByProtocol, &BlockIoGUID, 0, &memSize, 0)
+ 			!= EFI_BUFFER_TOO_SMALL)
+@@ -206,8 +270,33 @@ platform_add_boot_device(struct stage2_args *args, NodeList *devicesList)
+ 		if (device == NULL)
+ 			panic("Can't allocate memory for block devices!");
+ 		devicesList->Insert(device);
++
++		efi_device_path_protocol* diskPath;
++		bool isLoaderDisk = loaderDisk == NULL && loaderPath != NULL
++			&& kBootServices->HandleProtocol(handles[n], &DevicePathGUID,
++				(void**)&diskPath) == EFI_SUCCESS
++			&& device_path_starts_with(loaderPath, diskPath);
++		if (isLoaderDisk)
++			loaderDisk = device;
++
++		dprintf("efi: disk %" B_PRId32 ": %" B_PRIu64 " MiB, %" B_PRIu32
++			"-byte blocks%s%s\n", diskCount++,
++			(uint64)device->Size() / (1024 * 1024), device->BlockSize(),
++			blockIo->Media->RemovableMedia ? ", removable" : "",
++			isLoaderDisk ? ", the boot loader's" : "");
+ 	}
+ 
++	if (loaderDisk != NULL) {
++		// Look for the system on the disk the firmware loaded us from first
++		// (after a network disk, which only ip= in the load options adds):
++		// when other disks hold a Haiku system too, the one the firmware was
++		// told to boot is still what the user picked. The firmware lists the
++		// built-in disks first.
++		devicesList->Remove(loaderDisk);
++		devicesList->InsertAfter(remoteDisk, loaderDisk);
++	} else
++		dprintf("efi: the boot loader's disk is unknown\n");
++
+ 	return devicesList->Count() > 0 ? B_OK : B_ENTRY_NOT_FOUND;
+ }
+ 
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index 411813a5d7..ce1de9f55e 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -64,6 +64,16 @@ software emulation (`-cpu max` emulates AES-NI).
+   with its magic damaged too (the loader and the kernel must both use the
+   secondary copy); the RAM after boots 1 and 2 must hold no copy of the
+   volume key; the host reads back what Haiku wrote.
++- `qemu/run-loader-disk-test.sh <anyboot image> <haiku_loader.efi> <work dir>
++  <bfs_shell>`: the EFI loader started from a USB stick on a machine with
++  Haiku on its internal disk, which the firmware lists first (as on
++  some laptops): the internal disk is a raw BFS volume with the
++  image's system package and 152 old package states. The loader must boot
++  the stick's system, not the internal disk's; the boot menu must list
++  both; started from a disk with only an ESP, the loader boots the
++  internal disk and still lists the stick (a second heap region).
++  `qemu/anyboot_layout.py` finds the image's BFS partition, its ESP and its
++  El Torito EFI image (OVMF boots a hybrid stick through the latter); `qemu/loader_console.py` presses Space for the boot menu.
+ 
+ - `qemu/run-ui-test.sh`: the Haiku side, on the desktop, driven over ssh
+   (a test key; sshd started at boot by a launch job) with `hey`
+@@ -83,7 +93,7 @@ software emulation (`-cpu max` emulates AES-NI).
+ ## arm64
+ 
+ `arm64_compile_check.sh <generated.arm64> <out dir>` compiles every LUKS2
+-source for arm64 with the cross compiler of an arm64 build directory and
+-the flags of each
++source, and the boot loader files these changes touch, for arm64 with the
++cross compiler of an arm64 build directory and the flags of each
+ context (kernel add-on, kernel, EFI boot loader, userland), `-Werror`,
+ without building anything in the arm64 build directory.
+diff --git a/src/tests/system/luks2/arm64_compile_check.sh b/src/tests/system/luks2/arm64_compile_check.sh
+index 4973a647ef..4cb3b17aa1 100755
+--- a/src/tests/system/luks2/arm64_compile_check.sh
++++ b/src/tests/system/luks2/arm64_compile_check.sh
+@@ -51,6 +51,7 @@ boot="-Os -ffreestanding -fno-rtti
+ 	-DBOOT_SUPPORT_PARTITION_INTEL -DBOOT_SUPPORT_PARTITION_EFI
+ 	-DBOOT_SUPPORT_FILE_SYSTEM_BFS -DBOOT_SUPPORT_FILE_SYSTEM_TARFS
+ 	-DBOOT_SUPPORT_FILE_SYSTEM_FAT -D_BOOT_PLATFORM_EFI -DBOOT_SUPPORT_LUKS
++	-DBOOT_SUPPORT_HEAP_GROWTH
+ 	-DBOOT_SUPPORT_ELF64
+ 	-I$R/src/system/boot/loader -I$R/headers/private/kernel/disk_device_manager
+ 	-I$R/headers/private/kernel/util -I$R/headers/private/storage
+@@ -110,11 +111,16 @@ compile kernel "$kernel -I$R/headers/private/luks2
+ 	-I$R/headers/private/net -I$R/headers/private/storage
+ 	-I$R/headers/private/file_systems -I$R/src/system/kernel/device_manager" \
+ 	"$R/src/system/kernel/fs/vfs_boot.cpp"
+-for f in luks.cpp partitions.cpp main.cpp menu.cpp vfs.cpp; do
++for f in luks.cpp partitions.cpp main.cpp menu.cpp vfs.cpp heap.cpp; do
+ 	compile boot "$boot" "$R/src/system/boot/loader/$f"
+ done
+-compile boot "$boot -I$R/headers/private/kernel/platform
+-	-I$R/src/system/boot/platform/efi" "$R/src/system/boot/platform/efi/start.cpp"
++for f in start.cpp devices.cpp; do
++	compile boot "$boot -I$R/headers/private/kernel/platform
++		-I$R/src/system/boot/platform/efi
++		-I$R/src/add-ons/kernel/partitioning_systems/gpt
++		-I$R/src/system/boot/platform/efi/arch/arm64" \
++		"$R/src/system/boot/platform/efi/$f"
++done
+ 
+ # no AES accelerator is compiled in on arm64 yet: the portable AES only
+ for o in "$O"/*aes_xts.cpp.o; do
+diff --git a/src/tests/system/luks2/qemu/anyboot_layout.py b/src/tests/system/luks2/qemu/anyboot_layout.py
+new file mode 100755
+index 0000000000..d6f5fc37dd
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/anyboot_layout.py
+@@ -0,0 +1,51 @@
++#!/usr/bin/env python3
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Prints where the parts of an anyboot image are, in bytes:
++#   <BFS start> <BFS end> <ESP partition start> <El Torito EFI image start>
++# The ESP partition (MBR type 0xef) and the El Torito EFI image (what OVMF
++# boots from a hybrid stick) each hold a copy of the EFI boot loader.
++#
++# Usage: anyboot_layout.py <image>
++
++import struct
++import sys
++
++with open(sys.argv[1], "rb") as f:
++    mbr = f.read(512)
++    if mbr[510:512] != b"\x55\xaa":
++        sys.exit("no MBR")
++    bfs = esp = None
++    for i in range(4):
++        entry = mbr[0x1be + 16 * i:0x1be + 16 * (i + 1)]
++        kind = entry[4]
++        start, sectors = struct.unpack_from("<II", entry, 8)
++        if kind == 0xeb and bfs is None:
++            bfs = (start * 512, (start + sectors) * 512)
++        elif kind == 0xef and esp is None:
++            esp = start * 512
++    if bfs is None or esp is None:
++        sys.exit("no BFS or no ESP partition")
++
++    # the El Torito boot record is ISO 9660 sector 17
++    f.seek(17 * 2048)
++    record = f.read(2048)
++    if record[1:6] != b"CD001" or not record[7:30].startswith(b"EL TORITO"):
++        sys.exit("no El Torito boot record")
++    f.seek(struct.unpack_from("<I", record, 0x47)[0] * 2048)
++    catalog = f.read(2048)
++    eltorito = None
++    platform = catalog[1]
++    for i in range(32, 2048, 32):
++        entry = catalog[i:i + 32]
++        if entry[0] in (0x90, 0x91):
++            # a section header: the platform of the entries that follow
++            platform = entry[1]
++        elif entry[0] == 0x88 and platform == 0xef:
++            eltorito = struct.unpack_from("<I", entry, 8)[0] * 2048
++            break
++    if eltorito is None:
++        sys.exit("no El Torito EFI image")
++
++print(bfs[0], bfs[1], esp, eltorito)
+diff --git a/src/tests/system/luks2/qemu/loader_console.py b/src/tests/system/luks2/qemu/loader_console.py
+new file mode 100755
+index 0000000000..ddead9dc12
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/loader_console.py
+@@ -0,0 +1,86 @@
++#!/usr/bin/env python3
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Drives a QEMU guest's serial console for run-loader-disk-test.sh and logs
++# everything it reads. With --menu it presses Space until the boot loader's
++# menu shows, opens "Select boot volume/state" and stops once the list is
++# drawn; with --until it stops a moment after the text shows up.
++#
++# Usage: loader_console.py <serial socket> <log> [--menu] [--until <text>]
++#            [--timeout <seconds>]
++
++import socket
++import sys
++import time
++
++serial_path, log_path = sys.argv[1:3]
++options = sys.argv[3:]
++use_menu = "--menu" in options
++until = None
++if "--until" in options:
++    until = options[options.index("--until") + 1].encode()
++timeout = 600
++if "--timeout" in options:
++    timeout = int(options[options.index("--timeout") + 1])
++
++
++def connect(path):
++    deadline = time.time() + 30
++    while True:
++        try:
++            s = socket.socket(socket.AF_UNIX)
++            s.connect(path)
++            return s
++        except OSError:
++            if time.time() > deadline:
++                raise
++            time.sleep(0.2)
++
++
++serial = connect(serial_path)
++serial.settimeout(0.05)
++log = open(log_path, "wb")
++seen = b""
++state = "space" if use_menu else "watch"
++start = time.time()
++last_space = 0
++done_at = None
++
++while time.time() - start < timeout:
++    try:
++        chunk = serial.recv(65536)
++        if not chunk:
++            break
++    except socket.timeout:
++        chunk = b""
++    if chunk:
++        log.write(chunk)
++        log.flush()
++        seen += chunk
++
++    now = time.time()
++    if state == "space":
++        # the loader looks for Space for a moment only: keep pressing it
++        if b"Select boot volume/state" in seen:
++            time.sleep(1.5)
++            serial.sendall(b"\r")
++            state = "list"
++            print("console: opened the volume list", flush=True)
++        elif now - last_space > 0.05:
++            serial.sendall(b" ")
++            last_space = now
++    elif state == "list":
++        title = seen.find(b"Select Boot Volume/State")
++        if title >= 0 and seen.find(b"Rescan volumes", title) >= 0:
++            # let the rest of the screen arrive
++            done_at = now + 3
++            state = "wait"
++    elif state == "wait" and now > done_at:
++        break
++    if until is not None and until in seen:
++        time.sleep(2)
++        break
++
++log.close()
++print("console: done after %d s" % (time.time() - start), flush=True)
+diff --git a/src/tests/system/luks2/qemu/run-loader-disk-test.sh b/src/tests/system/luks2/qemu/run-loader-disk-test.sh
+new file mode 100755
+index 0000000000..9c15c43eb8
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/run-loader-disk-test.sh
+@@ -0,0 +1,185 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# The EFI boot loader on a machine that has Haiku installed on its internal
++# disk, started from a USB stick (QEMU x86_64, OVMF): the firmware lists the
++# internal disk first, as some laptops do. The internal disk is a
++# raw BFS volume with the image's system package and 152 old package
++# states; the stick is the anyboot image with the new loader.
++#  - boot 1: no keys pressed: the loader must boot the stick's system, the
++#    disk it was loaded from, not the internal disk's;
++#  - boot 2: the boot menu must list both systems (on a laptop, the heap
++#    ran out while the stick was checked, and it was missing);
++#  - boot 3: loaded from a disk with only an ESP, the loader falls back to
++#    the internal disk and its 152 states; the menu must still list the
++#    stick, which needs a second heap region.
++#
++# Usage: run-loader-disk-test.sh <anyboot image> <haiku_loader.efi>
++#            <work dir> <bfs_shell>
++
++set -e
++IMAGE=$1
++LOADER=$2
++W=$3
++BFS=$4
++HERE=$(cd "$(dirname "$0")" && pwd)
++mkdir -p "$W"
++cd "$W"
++
++passed=0
++failed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++bad() { failed=$((failed + 1)); echo "FAIL $*"; }
++
++set -- $(python3 -I "$HERE/anyboot_layout.py" "$IMAGE")
++bfsStart=$1
++bfsEnd=$2
++espStart=$3
++elToritoStart=$4
++if [ -z "$elToritoStart" ]; then
++	echo "$IMAGE isn't an anyboot image"
++	exit 1
++fi
++
++echo "== the stick: the anyboot image with the new loader in both places"
++cp "$IMAGE" stick.img
++mcopy -o -i stick.img@@$elToritoStart "$LOADER" ::/EFI/BOOT/BOOTX64.EFI
++mcopy -o -i stick.img@@$espStart "$LOADER" ::/EFI/BOOT/BOOTX64.EFI
++
++echo "== the internal disk: raw BFS, the system package, 152 old states"
++package=$(printf 'ls /myfs/system/packages\nquit\n' \
++	| "$BFS" --start-offset $bfsStart --end-offset $bfsEnd "$IMAGE" 2>&1 \
++	| grep -a -o 'haiku-r[^ ]*\.hpkg' | head -1)
++rm -f "$package" internal.img
++printf 'cp /myfs/system/packages/%s :%s/%s\nquit\n' "$package" "$W" \
++	"$package" | "$BFS" --start-offset $bfsStart --end-offset $bfsEnd \
++	"$IMAGE" > /dev/null 2>&1
++printf '%s\n' "$package" > activated-packages
++truncate -s 1200M internal.img
++"$BFS" --initialize internal.img "Haiku HD" "block_size 2048" > /dev/null
++{
++	echo "mkdir -p /myfs/system/packages/administrative"
++	echo "cp :$W/$package /myfs/system/packages/$package"
++	for day in $(seq 6 24); do
++		for hour in 01 02 03 04 05 06 07 08; do
++			state=state_2026-10-$(printf %02d $day)_$hour:00:00
++			echo "mkdir /myfs/system/packages/administrative/$state"
++			echo "cp :$W/activated-packages" \
++				"/myfs/system/packages/administrative/$state/activated-packages"
++		done
++	done
++	echo sync
++	echo quit
++} | "$BFS" internal.img > internal.log 2>&1
++rm -f "$package"
++
++echo "== a disk with only an ESP, holding the new loader"
++rm -f esp.img
++truncate -s 64M esp.img
++sgdisk -n 1:2048:0 -t 1:ef00 esp.img > /dev/null
++mformat -i esp.img@@1M -F -v ESP ::
++mmd -i esp.img@@1M ::/EFI ::/EFI/BOOT
++mcopy -i esp.img@@1M "$LOADER" ::/EFI/BOOT/BOOTX64.EFI
++
++# boot <name> <extra QEMU options> <console options...>
++# The internal disk is connected first (bootindex 0, nothing to boot on it)
++# so that the firmware lists it first; the stick follows.
++boot() {
++	name=$1
++	extra=$2
++	shift 2
++	cp /usr/share/OVMF/OVMF_VARS_4M.fd vars-$name.fd
++	rm -f serial-$name.sock
++	timeout 900 qemu-system-x86_64 -M q35 -cpu max -smp 2 -m 2048 \
++		-accel tcg,thread=multi \
++		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
++		-drive if=pflash,format=raw,file=vars-$name.fd \
++		$extra \
++		-drive if=none,id=internal,file=internal.img,format=raw,snapshot=on \
++		-device nvme,drive=internal,serial=internal,bootindex=1 \
++		-device qemu-xhci,id=xhci \
++		-drive if=none,id=stick,file=stick.img,format=raw,snapshot=on \
++		-device usb-storage,bus=xhci.0,drive=stick,bootindex=2 \
++		-nic none -display none -no-reboot \
++		-chardev socket,id=ser0,path=serial-$name.sock,server=on,wait=on \
++		-serial chardev:ser0 \
++		> qemu-$name.log 2>&1 &
++	qemu=$!
++	python3 -I "$HERE/loader_console.py" serial-$name.sock serial-$name.log \
++		"$@" || true
++	kill $qemu 2>/dev/null || true
++	wait $qemu 2>/dev/null || true
++	# the console as lines, without escape sequences
++	sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' serial-$name.log | tr '\r' '\n' \
++		> text-$name.log
++	grep -a -E "^efi: |heap region|Out of memory|Mounted boot partition" \
++		text-$name.log | sed 's/^/  /' || true
++}
++
++listed() {
++	# listed <name> <volume>: the volume list shows the volume (only what
++	# follows the list's title: the main menu names the boot volume too)
++	sed -n '/Select Boot Volume\/State/,$p' text-$1.log \
++		| sed '1s/.*Select Boot Volume\/State//' \
++		| grep -a -q -E "$2 \([0-9.]+ [MG]iB\)"
++}
++
++echo "== boot 1: the loader boots the stick, not the internal disk"
++boot first "" --until "Mounted boot partition" --timeout 600
++stickMiB=$(( $(stat -c %s stick.img) / 1048576 ))
++if grep -a -q -E "^efi: disk [0-9]+: $stickMiB MiB.*the boot loader's" \
++		text-first.log; then
++	ok "the loader found the disk it was loaded from"
++else
++	bad "the loader found the disk it was loaded from"
++fi
++if grep -a -q "Mounted boot partition: /dev/disk/usb/" text-first.log; then
++	ok "Haiku booted from the stick"
++else
++	bad "Haiku booted from the stick"
++fi
++
++echo "== boot 2: the boot menu lists both systems"
++boot second "" --menu --timeout 300
++if grep -a -q "Select boot volume/state (Current: Haiku (" text-second.log; then
++	ok "the menu's boot volume is the stick's"
++else
++	bad "the menu's boot volume is the stick's"
++fi
++if listed second "Haiku" && listed second "Haiku HD"; then
++	ok "both systems are listed"
++else
++	bad "both systems are listed"
++fi
++if grep -a -q "Out of memory" text-second.log; then
++	bad "no out of memory"
++else
++	ok "no out of memory"
++fi
++
++echo "== boot 3: from an ESP-only disk: the internal disk boots, the heap grows"
++boot third "-drive if=none,id=esp,file=esp.img,format=raw,snapshot=on
++	-device nvme,drive=esp,serial=esp,bootindex=0" --menu --timeout 300
++if grep -a -q -E "^efi: disk [0-9]+: 64 MiB.*the boot loader's" \
++		text-third.log \
++	&& grep -a -q "Select boot volume/state (Current: Haiku HD (" \
++		text-third.log; then
++	ok "nothing to boot on the loader's disk: the internal disk is used"
++else
++	bad "nothing to boot on the loader's disk: the internal disk is used"
++fi
++if listed third "Haiku" && listed third "Haiku HD"; then
++	ok "both systems are listed"
++else
++	bad "both systems are listed"
++fi
++if grep -a -q "heap region 2 added" text-third.log \
++	&& ! grep -a -q "Out of memory" text-third.log; then
++	ok "the heap grew instead of running out"
++else
++	bad "the heap grew instead of running out"
++fi
++
++echo "$passed passed, $failed failed"
++[ $failed -eq 0 ]

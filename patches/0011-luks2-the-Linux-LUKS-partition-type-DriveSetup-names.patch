@@ -1,0 +1,267 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 13:43:34 -0500
+Subject: [PATCH 11/15] luks2: the Linux LUKS partition type; DriveSetup names
+ LUKS2 volumes
+
+DriveSetup listed an encrypted partition as "Unknown (Linux data)": its
+list names only file systems it recognises, and wrote the same text into
+the Partition type column too.
+
+- The GPT type CA7D7CCB-63ED-4C53-861C-1742536059CC and MBR type 0xe8
+  are in Haiku's partition type lists as "Linux LUKS", so DriveSetup
+  shows and offers them.
+- EncryptedVolume's Encrypt gives the partition that type after
+  formatting it, where the partitioning system has it; a failure is
+  only logged. A partition typed "Be File System" (DriveSetup's
+  default) is then no longer taken for one by a boot loader.
+- DriveSetup's list: "LUKS2 encrypted" under File system and the
+  header's name under Volume name for a LUKS2 partition or disk (also
+  with only the secondary header intact); the Partition type column
+  shows the type itself.
+
+GUI test: partition 2 starts as BFS and must end up Linux LUKS (checked
+on the host with sgdisk); a DriveSetup screenshot. 4 of 4, the guest
+25 of 25, the installed disk 5 of 5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/luks2/luks2_userland.h        |  4 ++
+ .../gpt/gpt_known_guids.h                     |  2 +
+ .../intel/PartitionMap.cpp                    |  1 +
+ src/apps/drivesetup/PartitionList.cpp         | 22 +++++++++-
+ src/apps/encryptedvolume/EncryptedVolume.cpp  | 42 +++++++++++++++++++
+ src/tests/system/luks2/README.md              |  8 ++--
+ src/tests/system/luks2/qemu/guest-ui-test.sh  | 17 ++++++++
+ src/tests/system/luks2/qemu/run-ui-test.sh    | 11 ++++-
+ 8 files changed, 101 insertions(+), 6 deletions(-)
+
+diff --git a/headers/private/luks2/luks2_userland.h b/headers/private/luks2/luks2_userland.h
+index ec11340672..d370c5064d 100644
+--- a/headers/private/luks2/luks2_userland.h
++++ b/headers/private/luks2/luks2_userland.h
+@@ -31,6 +31,10 @@ extern "C" {
+ 
+ // luks2_partitions.cpp
+ 
++/*!	The partition type name of a LUKS volume, in the GPT (the Linux LUKS
++	GUID) and in the MBR (type 0xe8) partitioning systems. */
++#define LUKS2_PARTITION_TYPE "Linux LUKS"
++
+ /*!	Tells whether \a path (a partition or disk) has a LUKS2 header and
+ 	returns its label and UUID (both may be NULL). Reads only the binary
+ 	header of the primary copy, or of the secondary when the primary's magic
+diff --git a/src/add-ons/kernel/partitioning_systems/gpt/gpt_known_guids.h b/src/add-ons/kernel/partitioning_systems/gpt/gpt_known_guids.h
+index 69ea21eea8..635f9de3e1 100644
+--- a/src/add-ons/kernel/partitioning_systems/gpt/gpt_known_guids.h
++++ b/src/add-ons/kernel/partitioning_systems/gpt/gpt_known_guids.h
+@@ -68,6 +68,8 @@ const static struct type_map {
+ 	{{0xE6D6D379, 0xF507, 0x44C2, 0xA23C238F2A3DF928LL}, "Linux data (LVM)"},
+ 	{{0xA19D880F, 0x05FC, 0x4D3B, 0xA006743F0F84911ELL}, "Linux data (RAID)"},
+ 	{{0x0657FD6D, 0xA4AB, 0x43C4, 0x84E50933C84B4F4FLL}, "Linux swap"},
++	{{0xCA7D7CCB, 0x63ED, 0x4C53, 0x861C1742536059CCLL}, "Linux LUKS"},
++		// a LUKS encrypted volume (EncryptedVolume sets it)
+ 	// Microsoft partitions
+ 	{{0xEBD0A0A2, 0xB9E5, 0x4433, 0x87C068B6B72699C7LL}, "Windows data"},
+ 	{{0xE3C9E316, 0x0B5C, 0x4DB8, 0x817DF92DF00215AELL}, "Microsoft Reserved"},
+diff --git a/src/add-ons/kernel/partitioning_systems/intel/PartitionMap.cpp b/src/add-ons/kernel/partitioning_systems/intel/PartitionMap.cpp
+index 04739748bc..6ff3a3871d 100644
+--- a/src/add-ons/kernel/partitioning_systems/intel/PartitionMap.cpp
++++ b/src/add-ons/kernel/partitioning_systems/intel/PartitionMap.cpp
+@@ -56,6 +56,7 @@ static const struct partition_type kPartitionTypes[] = {
+     { 0x0c, "FAT 32-bit, LBA-mapped", true }, 
+     { 0x82, "Linux swap", true }, 
+     { 0x83, "Linux native", true }, 
++    { 0xe8, "Linux LUKS", true },
+     { 0xa5, "FreeBSD", true }, 
+     { 0xa6, "OpenBSD", true }, 
+     { 0xa9, "NetBSD", true }, 
+diff --git a/src/apps/drivesetup/PartitionList.cpp b/src/apps/drivesetup/PartitionList.cpp
+index 2666050c36..718f3b5469 100644
+--- a/src/apps/drivesetup/PartitionList.cpp
++++ b/src/apps/drivesetup/PartitionList.cpp
+@@ -26,6 +26,7 @@
+ #include <VolumeRoster.h>
+ 
+ #include <driver_settings.h>
++#include <luks2/luks2_userland.h>
+ 
+ #include "EncryptionUtils.h"
+ #include "Support.h"
+@@ -259,6 +260,14 @@ PartitionListRow::PartitionListRow(BPartition* partition)
+ 	appendParameter(parameters, volume.KnowsQuery(), B_TRANSLATE("Queries"));
+ 
+ 	const char* encrypter = EncryptionType(path.Path());
++	// a LUKS2 volume, also when only its secondary header is intact
++	char luksLabel[B_FILE_NAME_LENGTH];
++	bool isLUKS2 = !partition->ContainsFileSystem()
++		&& partition->CountChildren() == 0
++		&& luks2_partition_label(path.Path(), luksLabel, sizeof(luksLabel),
++			NULL, 0);
++	if (encrypter == NULL && isLUKS2)
++		encrypter = B_TRANSLATE("LUKS encrypted");
+ 	if (encrypter != NULL) {
+ 		appendParameter(parameters, true, encrypter);
+ 		fEncrypted = true;
+@@ -295,6 +304,13 @@ PartitionListRow::PartitionListRow(BPartition* partition)
+ 	if (partition->ContainsFileSystem()) {
+ 		SetField(new BStringField(partition->ContentType()), kFilesystemColumn);
+ 		SetField(new BStringField(partition->ContentName()), kVolumeNameColumn);
++	} else if (isLUKS2) {
++		// no file system the disk device manager knows: say what it is, with
++		// the name in its header (the volume inside shows up as a device of
++		// its own while it's unlocked)
++		SetField(new BStringField(B_TRANSLATE("LUKS2 encrypted")),
++			kFilesystemColumn);
++		SetField(new BStringField(luksLabel), kVolumeNameColumn);
+ 	} else if (partition->IsDevice()) {
+ 		SetField(new BStringField(kUnavailableString), kFilesystemColumn);
+ 		BString deviceName(kUnavailableString);
+@@ -306,9 +322,11 @@ PartitionListRow::PartitionListRow(BPartition* partition)
+ 		SetField(new BStringField(kUnavailableString), kVolumeNameColumn);
+ 	} else {
+ 		if (!partitionType.IsEmpty()) {
+-			partitionType.SetToFormat(B_TRANSLATE("Unknown (%s)"),
++			// (not in partitionType: the "Partition type" column shows it)
++			BString unknown;
++			unknown.SetToFormat(B_TRANSLATE("Unknown (%s)"),
+ 				partitionType.String());
+-			SetField(new BStringField(partitionType), kFilesystemColumn);
++			SetField(new BStringField(unknown), kFilesystemColumn);
+ 		} else
+ 			SetField(new BStringField(kUnavailableString), kFilesystemColumn);
+ 
+diff --git a/src/apps/encryptedvolume/EncryptedVolume.cpp b/src/apps/encryptedvolume/EncryptedVolume.cpp
+index e14840752b..16d27a82e3 100644
+--- a/src/apps/encryptedvolume/EncryptedVolume.cpp
++++ b/src/apps/encryptedvolume/EncryptedVolume.cpp
+@@ -382,6 +382,46 @@ unlock(Job& job, BMessage& result)
+ }
+ 
+ 
++/*!	Gives the partition at \a path the "Linux LUKS" type, when its
++	partitioning system has one (GPT, MBR): other systems then see what it
++	is, and boot loaders don't take it for a file system of the type it had
++	("Be File System" is DriveSetup's default). Nothing else depends on it,
++	so a failure is only logged. */
++static void
++set_luks_partition_type(const char* path)
++{
++	BDiskDevice disk;
++	BPartition* partition;
++	status_t status = find_partition(path, &disk, &partition);
++	if (status != B_OK || partition->IsDevice())
++		return;
++	if (partition->Type() != NULL
++		&& strcmp(partition->Type(), LUKS2_PARTITION_TYPE) == 0)
++		return;
++	// (CanSetType() and ValidateSetType() need prepared modifications)
++	status = disk.PrepareModifications();
++	if (status != B_OK) {
++		fprintf(stderr, "EncryptedVolume: %s keeps its partition type: %s\n",
++			path, strerror(status));
++		return;
++	}
++	if (!partition->CanSetType())
++		status = B_NOT_SUPPORTED;
++	else
++		status = partition->ValidateSetType(LUKS2_PARTITION_TYPE);
++	if (status == B_OK)
++		status = partition->SetType(LUKS2_PARTITION_TYPE);
++	if (status == B_OK)
++		status = disk.CommitModifications();
++	else
++		disk.CancelModifications();
++	if (status != B_OK) {
++		fprintf(stderr, "EncryptedVolume: %s keeps its partition type: %s\n",
++			path, strerror(status));
++	}
++}
++
++
+ static status_t
+ encrypt(Job& job, BMessage& result)
+ {
+@@ -427,6 +467,8 @@ encrypt(Job& job, BMessage& result)
+ 		return B_ERROR;
+ 	}
+ 
++	set_luks_partition_type(job.path.String());
++
+ 	char device[B_PATH_NAME_LENGTH];
+ 	status_t status = luks2_open_device(job.path.String(), key, keySize, false,
+ 		device, sizeof(device), NULL);
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index ce1de9f55e..b81c23b897 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -84,9 +84,11 @@ software emulation (`-cpu max` emulates AES-NI).
+   `EncryptedVolume --lock` (DriveSetup's Lock); a 513-byte passphrase is
+   refused (not cut to 512), a volume unlocked while the Encrypt window is
+   open isn't overwritten, `--encrypt` on a mounted device is refused; a
+-  partition of a GPT disk
+-  encrypted, Installer installs onto it and puts its EFI loader on the
+-  disk's ESP; then that disk boots on its own and asks for the passphrase.
++  partition of a GPT disk, typed BFS as DriveSetup creates it,
++  encrypted (its type must become Linux LUKS), Installer installs onto it
++  and puts its EFI loader on the disk's ESP; a DriveSetup screenshot
++  (`shots/ui-drivesetup.png`: "LUKS2 encrypted", the volume's name, "Linux
++  LUKS"); then that disk boots on its own and asks for the passphrase.
+   Needs `qemu/locale-settings` (en_US; or `LOCALE_SETTINGS`) so
+   the first boot doesn't stop at the language prompt.
+ 
+diff --git a/src/tests/system/luks2/qemu/guest-ui-test.sh b/src/tests/system/luks2/qemu/guest-ui-test.sh
+index fdad86b3ed..58eae9ceb4 100755
+--- a/src/tests/system/luks2/qemu/guest-ui-test.sh
++++ b/src/tests/system/luks2/qemu/guest-ui-test.sh
+@@ -216,4 +216,21 @@ luks dump "$TARGET/1" | sed -n 's/^  UUID: *//p' > $S/luks-test/uuid
+ sync
+ hey Installer quit > /dev/null 2>&1
+ 
++echo "== 7. DriveSetup lists the encrypted partition (a screenshot)"
++# Its partition list can't be read with hey: the host keeps the screenshot.
++# The encrypted partition should read "LUKS2 encrypted", "HaikuLUKS",
++# "Linux LUKS"; the blank disk of section 1 "LUKS2 encrypted", "Secret".
++DriveSetup > /tmp/drivesetup.log 2>&1 &
++if wait_window DriveSetup DriveSetup; then
++	sleep 3
++	hey DriveSetup set Frame of Window 0 to "BRect(20,40,1180,560)" \
++		> /dev/null 2>&1
++	sleep 2
++	screenshot -s -f png /boot/home/ui-drivesetup.png
++	ok "DriveSetup screenshot taken"
++	hey DriveSetup quit > /dev/null 2>&1
++else
++	bad "no DriveSetup window"
++fi
++
+ echo "done: $passed passed, $failed failed"
+diff --git a/src/tests/system/luks2/qemu/run-ui-test.sh b/src/tests/system/luks2/qemu/run-ui-test.sh
+index dcc475a419..17d51069c9 100755
+--- a/src/tests/system/luks2/qemu/run-ui-test.sh
++++ b/src/tests/system/luks2/qemu/run-ui-test.sh
+@@ -33,7 +33,9 @@ rm -f blank.img target.img esp.img
+ truncate -s 256M blank.img
+ printf 'LUKSTEST-BLANK' | dd of=blank.img conv=notrunc 2>/dev/null
+ truncate -s 1400M target.img
+-sgdisk -n 1:2048:+64M -t 1:ef00 -c 1:"EFI system" -n 2:0:0 -t 2:8309 \
++# partition 2 typed BFS, as DriveSetup creates it: encrypting must make it
++# Linux LUKS
++sgdisk -n 1:2048:+64M -t 1:ef00 -c 1:"EFI system" -n 2:0:0 -t 2:eb00 \
+ 	-c 2:"Haiku (encrypted)" target.img > /dev/null
+ truncate -s 64M esp.img
+ mformat -i esp.img -F -v EFI ::
+@@ -159,6 +161,13 @@ else
+ 	bad "no EFI loader on the ESP"
+ fi
+ 
++if sgdisk -i 2 target.img | grep -q -i \
++		"Partition GUID code: CA7D7CCB-63ED-4C53-861C-1742536059CC"; then
++	ok "encrypting partition 2 changed its type to Linux LUKS"
++else
++	bad "partition 2's type: $(sgdisk -i 2 target.img | sed -n 's/^Partition GUID code: //p')"
++fi
++
+ echo "== booting the installed encrypted disk on its own"
+ cp /usr/share/OVMF/OVMF_VARS_4M.fd vars2.fd
+ rm -f s2.sock m2.sock

@@ -1,0 +1,1986 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 01:28:18 -0500
+Subject: [PATCH 03/15] Boot from an encrypted (LUKS2) system volume
+
+The boot loader (src/system/boot/loader/luks.cpp, enabled for the EFI
+loaders of all architectures, BOOT_SUPPORT_LUKS):
+- a partition with neither a partition table nor a known file system but
+  a LUKS2 header is kept as a locked volume, with its own descriptor of the
+  device (the loader recreates Partition objects when it scans again; the
+  same volume seen twice is one);
+- with no other boot volume, it asks for the passphrase right away (no
+  echo, Backspace, Esc for the boot menu, asks again after a wrong one);
+  the boot menu's volume list has "Unlock encrypted volume ..." items;
+- an EncryptedDisk node decrypts the volume and is scanned like a disk, so
+  the BFS volume inside becomes the boot volume;
+- the volume's UUID and key go into the boot volume message, as its last
+  field (a later one could make the message grow and leave a copy of the
+  key in the freed buffer); right after the message is copied to the kernel
+  args, the key, the ciphers and the loader's copy are wiped.
+
+The kernel (vfs_boot.cpp) takes the keys out of the boot volume message and
+wipes them there before anything reads it, opens the partition with that
+UUID through luks_disk's boot module after the first device scan, scans
+again, and finds the boot partition on the decrypted device by the usual
+disk identifier; then its copy of the keys is wiped. No second prompt.
+Using the boot volume message rather than a kernel_args field keeps older
+kernels bootable from this loader and older loaders working with this
+kernel.
+
+The EFI loader switches off the firmware's 5 minute watchdog, which reset
+the machine when someone took longer at the boot menu or the passphrase
+prompt.
+
+Tested in QEMU (x86_64, UEFI/OVMF, NVMe), src/tests/system/luks2/qemu/
+run-boot-test.sh, 13 checks: the passphrase typed through OVMF's serial
+console; with AES-NI and with the portable AES; a wrong passphrase first;
+through the boot menu; a 512 MiB, 4-lane argon2id keyslot added by
+cryptsetup; no copy of the whole volume key (nor the passphrase) left in
+the guest's RAM after boot; what Haiku wrote read back on the build host.
+arm64_compile_check.sh compiles all LUKS2 sources for arm64.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/kernel/boot/kernel_args.h     |   6 +
+ headers/private/kernel/boot/partitions.h      |   4 +-
+ src/system/boot/Jamfile                       |   1 +
+ src/system/boot/loader/Jamfile                |  33 +
+ src/system/boot/loader/luks.cpp               | 638 ++++++++++++++++++
+ src/system/boot/loader/luks.h                 |  57 ++
+ src/system/boot/loader/main.cpp               |  26 +-
+ src/system/boot/loader/menu.cpp               |  28 +
+ src/system/boot/loader/partitions.cpp         |  23 +-
+ src/system/boot/loader/vfs.cpp                |   8 +
+ src/system/boot/platform/efi/start.cpp        |   6 +
+ src/system/kernel/fs/Jamfile                  |   1 +
+ src/system/kernel/fs/vfs_boot.cpp             | 155 +++++
+ src/tests/system/luks2/README.md              |  55 ++
+ src/tests/system/luks2/arm64_compile_check.sh | 125 ++++
+ src/tests/system/luks2/qemu/boot_console.py   | 150 ++++
+ .../system/luks2/qemu/guest-boot-test.sh      |  80 +++
+ src/tests/system/luks2/qemu/run-boot-test.sh  | 216 ++++++
+ 18 files changed, 1607 insertions(+), 5 deletions(-)
+ create mode 100644 src/system/boot/loader/luks.cpp
+ create mode 100644 src/system/boot/loader/luks.h
+ create mode 100644 src/tests/system/luks2/README.md
+ create mode 100755 src/tests/system/luks2/arm64_compile_check.sh
+ create mode 100755 src/tests/system/luks2/qemu/boot_console.py
+ create mode 100755 src/tests/system/luks2/qemu/guest-boot-test.sh
+ create mode 100755 src/tests/system/luks2/qemu/run-boot-test.sh
+
+diff --git a/headers/private/kernel/boot/kernel_args.h b/headers/private/kernel/boot/kernel_args.h
+index 8405960254..268715a57f 100644
+--- a/headers/private/kernel/boot/kernel_args.h
++++ b/headers/private/kernel/boot/kernel_args.h
+@@ -37,6 +37,12 @@
+ #define BOOT_VOLUME_PARTITION_OFFSET	"partition offset"
+ #define BOOT_VOLUME_DISK_IDENTIFIER		"disk identifier"
+ 
++// An encrypted (LUKS2) boot volume the boot loader unlocked: the volume's
++// UUID and its volume key. The kernel takes the key out of the message (and
++// wipes it there) before anything else reads the message.
++#define BOOT_VOLUME_LUKS_UUID			"luks uuid"
++#define BOOT_VOLUME_LUKS_KEY			"luks volume key"
++
+ // boot methods
+ enum {
+ 	BOOT_METHOD_HARD_DISK	= 0,
+diff --git a/headers/private/kernel/boot/partitions.h b/headers/private/kernel/boot/partitions.h
+index 2d19d27401..614a7e7843 100644
+--- a/headers/private/kernel/boot/partitions.h
++++ b/headers/private/kernel/boot/partitions.h
+@@ -37,6 +37,8 @@ class Partition : public Node, public partition_data {
+ 
+ 		bool IsFileSystem() const { return fIsFileSystem; }
+ 		bool IsPartitioningSystem() const { return fIsPartitioningSystem; }
++		bool IsEncrypted() const { return fIsEncrypted; }
++			// a locked LUKS2 volume (see loader/luks.cpp)
+ 		off_t BlockForIdentifierChecksum() { return fBlockForChecksum; }
+ 		const char *ModuleName() const { return fModuleName; }
+ 
+@@ -48,7 +50,7 @@ class Partition : public Node, public partition_data {
+ 		int			fFD;
+ 		NodeList	fChildren;
+ 		Partition	*fParent;
+-		bool		fIsFileSystem, fIsPartitioningSystem;
++		bool		fIsFileSystem, fIsPartitioningSystem, fIsEncrypted;
+ 		const char	*fModuleName;
+ 		off_t		fBlockForChecksum;
+ };
+diff --git a/src/system/boot/Jamfile b/src/system/boot/Jamfile
+index 689a6410e5..3a18bed994 100644
+--- a/src/system/boot/Jamfile
++++ b/src/system/boot/Jamfile
+@@ -374,6 +374,7 @@ for platform in [ MultiBootSubDirSetup ] {
+ 				boot_loader.a
+ 				boot_net.a
+ 				boot_partitions.a
++				boot_luks2.a
+ 
+ 				# file systems
+ 				boot_bfs.a
+diff --git a/src/system/boot/loader/Jamfile b/src/system/boot/loader/Jamfile
+index b0fed7f700..1a247a8b49 100644
+--- a/src/system/boot/loader/Jamfile
++++ b/src/system/boot/loader/Jamfile
+@@ -8,6 +8,8 @@ UsePrivateKernelHeaders ;
+ UsePrivateHeaders [ FDirName kernel disk_device_manager ] ;
+ UsePrivateHeaders [ FDirName kernel util ] ;
+ UsePrivateHeaders shared storage ;
++SubDirSysHdrs $(HAIKU_TOP) headers private ;
++	# <luks2/...>
+ 
+ local defines = $(DEFINES) ;
+ 
+@@ -33,6 +35,10 @@ for platform in [ MultiBootSubDirSetup ] {
+ 				DEFINES +=
+ 					_BOOT_PLATFORM_EFI
+ 					BOOT_SUPPORT_PARTITION_EFI
++
++					# LUKS2 encrypted volumes (luks.cpp): the EFI loaders of
++					# all architectures
++					BOOT_SUPPORT_LUKS
+ 				;
+ 			}
+ 
+@@ -135,6 +141,33 @@ for platform in [ MultiBootSubDirSetup ] {
+ 			Referenceable.cpp
+ 			;
+ 
++		# LUKS2 encrypted volumes: the loader's part and the LUKS2 code
++		# shared with the kernel driver and the luks tool
++		local luks2Accelerators ;
++		if $(TARGET_ARCH) = x86_64 {
++			luks2Accelerators = aes_ni.cpp ;
++		}
++		BootStaticLibrary [ MultiBootGristFiles boot_luks2 ] :
++			luks.cpp
++
++			json.cpp
++			luks2_read.cpp
++			luks2_util.cpp
++
++			aes_ct.c
++			aes_xts.cpp
++			argon2.cpp
++			sha2_hmac.cpp
++			$(luks2Accelerators)
++			;
++
++		SEARCH on [ FGristFiles json.cpp luks2_read.cpp luks2_util.cpp ]
++			= [ FDirName $(HAIKU_TOP) src libs luks2 ] ;
++		SEARCH on [ FGristFiles aes_ct.c aes_xts.cpp argon2.cpp sha2_hmac.cpp ]
++			= [ FDirName $(HAIKU_TOP) src libs luks2 crypto ] ;
++		SEARCH on [ FGristFiles aes_ni.cpp ]
++			= [ FDirName $(HAIKU_TOP) src libs luks2 arch x86 ] ;
++
+ 		# The partition support is built in an extra static library
+ 		# so that only the ones that are used will be included.
+ 
+diff --git a/src/system/boot/loader/luks.cpp b/src/system/boot/loader/luks.cpp
+new file mode 100644
+index 0000000000..92eef3df8d
+--- /dev/null
++++ b/src/system/boot/loader/luks.cpp
+@@ -0,0 +1,638 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++
++
++/*!	LUKS2 encrypted volumes in the boot loader: partitions with a LUKS2
++	header are kept as locked volumes; after the passphrase opened one, an
++	EncryptedDisk node decrypts it and is scanned like a disk, so the BFS
++	volume inside can be the boot volume. The kernel gets the volume key in
++	the boot volume message (see luks_register_boot_device()) and opens the
++	volume itself without asking again.
++
++	All of it is platform independent: it uses the loader's Node and
++	Partition classes, the text console and malloc() (whose large
++	allocations, Argon2's memory, come from the platform's page allocator).
++*/
++
++
++#include "luks.h"
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <boot/kernel_args.h>
++#include <boot/menu.h>
++#include <boot/partitions.h>
++#include <boot/platform/generic/text_console.h>
++#include <boot/stage2.h>
++#include <boot/stdio.h>
++#include <util/KMessage.h>
++
++#include <luks2/luks2.h>
++
++#include "loader.h"
++#include "RootFileSystem.h"
++
++
++//#define TRACE_LUKS
++#ifdef TRACE_LUKS
++#	define TRACE(x...) dprintf("luks: " x)
++#else
++#	define TRACE(x...) do {} while (false)
++#endif
++
++
++using namespace boot;
++
++
++static const size_t kMaxPassphraseLength = 512;
++static const size_t kBufferSize = 64 * 1024;
++
++
++struct LockedVolume;
++
++
++class EncryptedDisk : public Node {
++public:
++								EncryptedDisk(LockedVolume* volume,
++									const luks2_volume* header);
++	virtual						~EncryptedDisk();
++
++			status_t			Init(const uint8* key, size_t keySize);
++			void				Wipe();
++
++	virtual	ssize_t				ReadAt(void* cookie, off_t position,
++									void* buffer, size_t bufferSize);
++	virtual	ssize_t				WriteAt(void* cookie, off_t position,
++									const void* buffer, size_t bufferSize);
++	virtual	off_t				Size() const;
++	virtual	status_t			GetName(char* name, size_t nameSize) const;
++
++			const uint8*		Key() const { return fKey; }
++			size_t				KeySize() const { return fKeySize; }
++			const char*			UUID() const { return fUUID; }
++
++private:
++			LockedVolume*		fVolume;
++			luks2_xts			fCipher;
++			uint8				fKey[LUKS2_MAX_KEY_SIZE];
++			size_t				fKeySize;
++			uint64				fDataOffset;
++			off_t				fSize;
++			uint32				fSectorSize;
++			uint64				fIVTweak;
++			uint8*				fBuffer;
++			char				fUUID[LUKS2_UUID_SIZE];
++			char				fName[LUKS2_LABEL_SIZE + 16];
++			bool				fWiped;
++};
++
++
++/*!	A LUKS2 volume found while scanning. It keeps its own descriptor of the
++	device it's on: the loader deletes and recreates Partition objects when
++	it scans again. */
++struct LockedVolume {
++	LockedVolume*	next;
++	int				fd;			// of the device the volume is on
++	Node*			device;		// kept alive by fd
++	off_t			offset;		// of the LUKS2 partition on the device
++	off_t			size;
++	luks2_volume*	header;
++	EncryptedDisk*	disk;		// once unlocked
++	char			name[96];
++};
++
++
++static ssize_t
++volume_read(LockedVolume* volume, uint64 offset, void* buffer, size_t size)
++{
++	if (offset > (uint64)volume->size)
++		return 0;
++	if (size > (uint64)volume->size - offset)
++		size = volume->size - offset;
++	ssize_t bytesRead = read_pos(volume->fd, volume->offset + offset, buffer,
++		size);
++	return bytesRead < 0 ? (ssize_t)errno : bytesRead;
++}
++
++
++static LockedVolume* sVolumes = NULL;
++static LockedVolume* sBootVolume = NULL;
++
++
++// #pragma mark - EncryptedDisk
++
++
++EncryptedDisk::EncryptedDisk(LockedVolume* volume, const luks2_volume* header)
++	:
++	fVolume(volume),
++	fKeySize(0),
++	fDataOffset(header->segment.offset),
++	fSize(header->segment.size),
++	fSectorSize(header->segment.sector_size),
++	fIVTweak(header->segment.iv_tweak),
++	fBuffer(NULL),
++	fWiped(false)
++{
++	memset(&fCipher, 0, sizeof(fCipher));
++	memset(fKey, 0, sizeof(fKey));
++	strlcpy(fUUID, header->uuid, sizeof(fUUID));
++	snprintf(fName, sizeof(fName), "LUKS2 %s",
++		header->label[0] != '\0' ? header->label : header->uuid);
++}
++
++
++EncryptedDisk::~EncryptedDisk()
++{
++	Wipe();
++	free(fBuffer);
++}
++
++
++status_t
++EncryptedDisk::Init(const uint8* key, size_t keySize)
++{
++	if (keySize > sizeof(fKey))
++		return B_BAD_VALUE;
++	fBuffer = (uint8*)malloc(kBufferSize);
++	if (fBuffer == NULL)
++		return B_NO_MEMORY;
++	if (luks2_xts_set_key(&fCipher, key, keySize) != 0)
++		return B_BAD_VALUE;
++	memcpy(fKey, key, keySize);
++	fKeySize = keySize;
++	dprintf("luks: %s: %" B_PRIdOFF " bytes at %" B_PRIu64 ", sector size %"
++		B_PRIu32 ", AES-%u-XTS (%s)\n", fName, fSize, fDataOffset, fSectorSize,
++		(unsigned)(keySize * 4),
++		luks2_aes_implementation_name(fCipher.data.implementation));
++	return B_OK;
++}
++
++
++void
++EncryptedDisk::Wipe()
++{
++	luks2_xts_clear(&fCipher);
++	luks2_wipe(fKey, sizeof(fKey));
++	if (fBuffer != NULL)
++		luks2_wipe(fBuffer, kBufferSize);
++	fKeySize = 0;
++	fWiped = true;
++}
++
++
++ssize_t
++EncryptedDisk::ReadAt(void* cookie, off_t position, void* buffer,
++	size_t bufferSize)
++{
++	if (fWiped)
++		return B_NOT_ALLOWED;
++	if (position < 0)
++		return B_BAD_VALUE;
++	if (position >= fSize)
++		return 0;
++	if ((off_t)bufferSize > fSize - position)
++		bufferSize = fSize - position;
++
++	size_t done = 0;
++	while (done < bufferSize) {
++		uint64 current = position + done;
++		uint64 start = current / fSectorSize * fSectorSize;
++		size_t skip = current - start;
++		size_t chunk = skip + (bufferSize - done);
++		chunk = (chunk + fSectorSize - 1) / fSectorSize * fSectorSize;
++		if (chunk > kBufferSize)
++			chunk = kBufferSize;
++
++		ssize_t bytesRead = volume_read(fVolume, fDataOffset + start, fBuffer,
++			chunk);
++		if (bytesRead != (ssize_t)chunk)
++			return done > 0 ? (ssize_t)done : B_IO_ERROR;
++
++		for (size_t i = 0; i < chunk; i += fSectorSize) {
++			luks2_xts_decrypt(&fCipher,
++				(start + i) / LUKS2_IV_SECTOR_SIZE + fIVTweak, fBuffer + i,
++				fSectorSize);
++		}
++
++		size_t toCopy = chunk - skip;
++		if (toCopy > bufferSize - done)
++			toCopy = bufferSize - done;
++		memcpy((uint8*)buffer + done, fBuffer + skip, toCopy);
++		done += toCopy;
++	}
++	return done;
++}
++
++
++ssize_t
++EncryptedDisk::WriteAt(void* cookie, off_t position, const void* buffer,
++	size_t bufferSize)
++{
++	return B_NOT_ALLOWED;
++}
++
++
++off_t
++EncryptedDisk::Size() const
++{
++	return fSize;
++}
++
++
++status_t
++EncryptedDisk::GetName(char* name, size_t nameSize) const
++{
++	if (name == NULL)
++		return B_BAD_VALUE;
++	strlcpy(name, fName, nameSize);
++	return B_OK;
++}
++
++
++// #pragma mark - I/O on the LUKS2 partition
++
++
++static ssize_t
++header_read(void* cookie, uint64_t offset, void* buffer, size_t size)
++{
++	return volume_read((LockedVolume*)cookie, offset, buffer, size);
++}
++
++
++static luks2_device_io
++volume_io(LockedVolume* volume)
++{
++	luks2_device_io io = { volume, header_read, NULL, (uint64_t)volume->size };
++	return io;
++}
++
++
++// #pragma mark - locked volumes
++
++
++bool
++luks_probe_partition(Partition* partition)
++{
++	uint8 first[512];
++	if (partition->ReadAt(NULL, 0, first, sizeof(first)) != sizeof(first)
++		|| !luks2_has_signature(first, sizeof(first))) {
++		return false;
++	}
++
++	LockedVolume* volume = (LockedVolume*)calloc(1, sizeof(LockedVolume));
++	if (volume == NULL)
++		return false;
++	volume->fd = dup(partition->FD());
++	volume->device = volume->fd >= 0 ? get_node_from(volume->fd) : NULL;
++	volume->offset = partition->offset;
++	volume->size = partition->Size();
++	if (volume->device == NULL) {
++		if (volume->fd >= 0)
++			close(volume->fd);
++		free(volume);
++		return false;
++	}
++
++	luks2_device_io io = volume_io(volume);
++	int result = luks2_read_header(&io, &volume->header);
++	if (result != LUKS2_OK) {
++		dprintf("luks: partition at %" B_PRIdOFF ": %s\n", partition->offset,
++			luks2_error_string(result));
++		close(volume->fd);
++		free(volume);
++		return false;
++	}
++
++	// The loader scans disks more than once: the same volume seen again
++	for (LockedVolume* other = sVolumes; other != NULL; other = other->next) {
++		if (other->device == volume->device && other->offset == volume->offset
++			&& strcmp(other->header->uuid, volume->header->uuid) == 0) {
++			luks2_free_volume(volume->header);
++				close(volume->fd);
++			free(volume);
++			return true;
++		}
++	}
++
++	luks2_volume* header = volume->header;
++	uint64 size = header->segment.size;
++	const char* unit = "MiB";
++	uint64 tenths = size * 10 / (1024 * 1024);
++	if (tenths >= 10240) {
++		tenths /= 1024;
++		unit = "GiB";
++	}
++	snprintf(volume->name, sizeof(volume->name), "\"%s\" (%" B_PRIu64 ".%"
++		B_PRIu64 " %s)", header->label[0] != '\0' ? header->label : "unnamed",
++		tenths / 10, tenths % 10, unit);
++
++	// in the order found: the boot disk's partitions come first
++	LockedVolume** last = &sVolumes;
++	while (*last != NULL)
++		last = &(*last)->next;
++	*last = volume;
++
++	dprintf("luks: locked LUKS2 volume %s, UUID %s\n", volume->name,
++		header->uuid);
++	return true;
++}
++
++
++bool
++luks_has_locked_volumes()
++{
++	for (LockedVolume* volume = sVolumes; volume != NULL;
++			volume = volume->next) {
++		if (volume->disk == NULL)
++			return true;
++	}
++	return false;
++}
++
++
++// #pragma mark - the passphrase prompt
++
++
++static size_t
++encode_utf8(uint32 c, char* out)
++{
++	if (c < 0x80) {
++		out[0] = (char)c;
++		return 1;
++	}
++	if (c < 0x800) {
++		out[0] = (char)(0xc0 | (c >> 6));
++		out[1] = (char)(0x80 | (c & 0x3f));
++		return 2;
++	}
++	if (c < 0x10000) {
++		out[0] = (char)(0xe0 | (c >> 12));
++		out[1] = (char)(0x80 | ((c >> 6) & 0x3f));
++		out[2] = (char)(0x80 | (c & 0x3f));
++		return 3;
++	}
++	out[0] = (char)(0xf0 | (c >> 18));
++	out[1] = (char)(0x80 | ((c >> 12) & 0x3f));
++	out[2] = (char)(0x80 | ((c >> 6) & 0x3f));
++	out[3] = (char)(0x80 | (c & 0x3f));
++	return 4;
++}
++
++
++/*!	Reads a passphrase from the console without echo (one '*' per
++	character), as UTF-8. Returns its length, or -1 for Esc. */
++static ssize_t
++read_passphrase(char* buffer, size_t bufferSize)
++{
++	size_t length = 0;
++	while (true) {
++		int key = console_wait_for_key();
++		if (key == TEXT_CONSOLE_KEY_RETURN || key == '\n')
++			break;
++		if (key == TEXT_CONSOLE_KEY_ESCAPE) {
++			luks2_wipe(buffer, bufferSize);
++			printf("\n");
++			return -1;
++		}
++		if (key == TEXT_CONSOLE_KEY_BACKSPACE || key == 0x7f) {
++			if (length > 0) {
++				// remove the whole last UTF-8 character
++				do {
++					length--;
++				} while (length > 0 && ((uint8)buffer[length] & 0xc0) == 0x80);
++				printf("\b \b");
++			}
++			continue;
++		}
++		if (TEXT_CONSOLE_IS_CURSOR_KEY(key) || key < 0x20
++			|| (key >= 0xd800 && key < 0xe000) || key > 0x10ffff) {
++			continue;
++		}
++
++		char encoded[4];
++		size_t encodedLength = encode_utf8((uint32)key, encoded);
++		if (length + encodedLength >= bufferSize)
++			continue;
++		memcpy(buffer + length, encoded, encodedLength);
++		length += encodedLength;
++		luks2_wipe(encoded, sizeof(encoded));
++		printf("*");
++	}
++	buffer[length] = '\0';
++	printf("\n");
++	return length;
++}
++
++
++/*!	Scans the decrypted volume and returns the root directory of a bootable
++	volume on it, if there is one. */
++static Directory*
++bootable_volume_on(EncryptedDisk* disk)
++{
++	void* cookie;
++	if (gRoot->Open(&cookie, O_RDONLY) != B_OK)
++		return NULL;
++
++	Directory* found = NULL;
++	Directory* volume;
++	while (found == NULL
++		&& gRoot->GetNextNode(cookie, (Node**)&volume) == B_OK) {
++		Partition* partition;
++		if (gRoot->GetPartitionFor(volume, &partition) != B_OK)
++			continue;
++		// (get_node_from() doesn't add a reference)
++		if (get_node_from(partition->FD()) == disk && is_bootable(volume))
++			found = volume;
++	}
++	gRoot->Close(cookie);
++	return found;
++}
++
++
++/*!	Asks for the passphrase of \a volume until it opens or the user presses
++	Esc; then scans the decrypted contents. */
++static status_t
++unlock_volume(LockedVolume* volume)
++{
++	if (volume->disk != NULL)
++		return B_OK;
++
++	luks2_device_io io = volume_io(volume);
++	char* passphrase = (char*)malloc(kMaxPassphraseLength + 1);
++	if (passphrase == NULL)
++		return B_NO_MEMORY;
++
++	status_t status = B_ERROR;
++	for (int32 attempt = 0; ; attempt++) {
++		console_clear_screen();
++		printf("\n  Encrypted volume %s\n\n", volume->name);
++		if (attempt > 0)
++			printf("  That passphrase doesn't open this volume.\n\n");
++		printf("  Passphrase (Esc for the boot menu): ");
++
++		ssize_t length = read_passphrase(passphrase, kMaxPassphraseLength + 1);
++		if (length < 0) {
++			status = B_CANCELED;
++			break;
++		}
++
++		printf("\n  Unlocking...\n");
++		uint8 key[LUKS2_MAX_KEY_SIZE];
++		size_t keySize = 0;
++		int keyslot = -1;
++		int result = luks2_unlock(volume->header, &io, passphrase, length, -1,
++			key, &keySize, &keyslot);
++		luks2_wipe(passphrase, kMaxPassphraseLength + 1);
++
++		if (result == LUKS2_ERROR_BAD_PASSPHRASE)
++			continue;
++		if (result != LUKS2_OK) {
++			luks2_wipe(key, sizeof(key));
++			printf("\n  The volume can't be unlocked: %s.\n",
++				luks2_error_string(result));
++			if (result == LUKS2_ERROR_KDF_MEMORY)
++				printf("  Its keyslots need more memory than is free here.\n");
++			printf("\n  Press any key to continue.\n");
++			console_wait_for_key();
++			status = B_ERROR;
++			break;
++		}
++
++		dprintf("luks: %s opened with keyslot %d\n", volume->name, keyslot);
++		EncryptedDisk* disk = new(std::nothrow) EncryptedDisk(volume,
++			volume->header);
++		status = disk != NULL ? disk->Init(key, keySize) : B_NO_MEMORY;
++		luks2_wipe(key, sizeof(key));
++		if (status != B_OK) {
++			delete disk;
++			break;
++		}
++
++		volume->disk = disk;
++		add_partitions_for(disk, true, false);
++		status = B_OK;
++		break;
++	}
++
++	free(passphrase);
++	console_clear_screen();
++	return status;
++}
++
++
++status_t
++luks_unlock_boot_volume(BootVolume& bootVolume)
++{
++	for (LockedVolume* volume = sVolumes; volume != NULL;
++			volume = volume->next) {
++		if (volume->disk != NULL)
++			continue;
++
++		status_t status = unlock_volume(volume);
++		if (status == B_CANCELED)
++			return status;
++		if (status != B_OK)
++			continue;
++
++		Directory* root = bootable_volume_on(volume->disk);
++		if (root != NULL && bootVolume.SetTo(root) == B_OK)
++			return B_OK;
++		dprintf("luks: no bootable volume on %s\n", volume->name);
++	}
++	return B_ENTRY_NOT_FOUND;
++}
++
++
++// #pragma mark - boot menu
++
++
++void
++luks_add_menu_items(Menu* menu, bool (*target)(Menu* menu, MenuItem* item))
++{
++	for (LockedVolume* volume = sVolumes; volume != NULL;
++			volume = volume->next) {
++		if (volume->disk != NULL)
++			continue;
++		char label[128];
++		snprintf(label, sizeof(label), "Unlock encrypted volume %s",
++			volume->name);
++		MenuItem* item = new(std::nothrow) MenuItem(label);
++		if (item == NULL)
++			return;
++		item->SetType(MENU_ITEM_NO_CHOICE);
++		item->SetTarget(target);
++		item->SetData(volume);
++		item->SetHelpText("Asks for the passphrase of this LUKS2 volume and "
++			"boots from it.");
++		menu->AddItem(item);
++	}
++}
++
++
++Directory*
++luks_unlock_menu_item(MenuItem* item)
++{
++	LockedVolume* volume = (LockedVolume*)item->Data();
++	dprintf("luks: unlocking %s from the boot menu\n", volume->name);
++	if (unlock_volume(volume) != B_OK)
++		return NULL;
++	item->SetEnabled(false);
++	return bootable_volume_on(volume->disk);
++}
++
++
++// #pragma mark - handing the key to the kernel
++
++
++void
++luks_register_boot_device(Node* device)
++{
++	sBootVolume = NULL;
++	for (LockedVolume* volume = sVolumes; volume != NULL;
++			volume = volume->next) {
++		if (volume->disk != NULL && volume->disk == device) {
++			sBootVolume = volume;
++			return;
++		}
++	}
++}
++
++
++void
++luks_add_boot_volume_key()
++{
++	if (sBootVolume == NULL)
++		return;
++
++	EncryptedDisk* disk = sBootVolume->disk;
++	if (gBootParams.AddString(BOOT_VOLUME_LUKS_UUID, disk->UUID()) != B_OK
++		|| gBootParams.AddData(BOOT_VOLUME_LUKS_KEY, B_RAW_TYPE, disk->Key(),
++			disk->KeySize()) != B_OK) {
++		dprintf("luks: no room for the volume key in the boot volume "
++			"message\n");
++	}
++}
++
++
++void
++luks_cleanup()
++{
++	const void* data;
++	int32 size;
++	for (int32 i = 0; gBootParams.FindData(BOOT_VOLUME_LUKS_KEY, B_RAW_TYPE,
++			i, &data, &size) == B_OK; i++) {
++		luks2_wipe(const_cast<void*>(data), size);
++	}
++
++	for (LockedVolume* volume = sVolumes; volume != NULL;
++			volume = volume->next) {
++		if (volume->disk != NULL)
++			volume->disk->Wipe();
++	}
++}
+diff --git a/src/system/boot/loader/luks.h b/src/system/boot/loader/luks.h
+new file mode 100644
+index 0000000000..5d2b31cc6e
+--- /dev/null
++++ b/src/system/boot/loader/luks.h
+@@ -0,0 +1,57 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ */
++#ifndef LOADER_LUKS_H
++#define LOADER_LUKS_H
++
++
++#include <boot/vfs.h>
++
++
++class Menu;
++class MenuItem;
++
++namespace boot {
++	class Partition;
++}
++
++
++/*!	Called for a partition that has neither a partition table nor a file
++	system the loader knows: remembers it as a locked encrypted volume if it
++	has a LUKS2 header. */
++bool luks_probe_partition(boot::Partition* partition);
++
++bool luks_has_locked_volumes();
++
++/*!	Asks for the passphrase of each locked volume until one holds a bootable
++	system, which \a bootVolume is set to. Esc skips to the boot menu
++	(returns an error). */
++status_t luks_unlock_boot_volume(BootVolume& bootVolume);
++
++/*!	"Unlock encrypted volume ..." items for the boot volume menu. */
++void luks_add_menu_items(Menu* menu,
++	bool (*target)(Menu* menu, MenuItem* item));
++
++/*!	The target of those items: asks for the passphrase, and on success
++	returns the root directory of a bootable volume on it (or NULL). */
++Directory* luks_unlock_menu_item(MenuItem* item);
++
++/*!	Remembers the boot device; if it's a volume unlocked here, its UUID and
++	volume key go into the boot volume message (luks_add_boot_volume_key()),
++	so the kernel opens it without asking again. */
++void luks_register_boot_device(Node* device);
++
++/*!	Adds the boot volume's UUID and key to the boot volume message. Called
++	last, right before the message is copied to the kernel args: a field
++	added after it could make the message grow, which would leave a copy of
++	the key behind in the freed buffer. */
++void luks_add_boot_volume_key();
++
++/*!	Wipes the volume keys, the ciphers' key schedules and the key in the
++	loader's boot volume message. Called after the message was copied to
++	the kernel args; nothing can be read from encrypted volumes after it. */
++void luks_cleanup();
++
++
++#endif	// LOADER_LUKS_H
+diff --git a/src/system/boot/loader/main.cpp b/src/system/boot/loader/main.cpp
+index f5103034c8..9f587f1912 100644
+--- a/src/system/boot/loader/main.cpp
++++ b/src/system/boot/loader/main.cpp
+@@ -7,6 +7,9 @@
+ #include "menu.h"
+ #include "loader.h"
+ #include "load_driver_settings.h"
++#ifdef BOOT_SUPPORT_LUKS
++#	include "luks.h"
++#endif
+ 
+ #include <boot/stage2.h>
+ #include <boot/vfs.h>
+@@ -80,7 +83,18 @@ main(stage2_args *args)
+ 
+ 		mountedAllVolumes = true;
+ 
+-		if (user_menu(bootVolume, pathBlocklist) < B_OK) {
++		bool showMenu = true;
++#ifdef BOOT_SUPPORT_LUKS
++		// An encrypted system volume: ask for its passphrase right away,
++		// and boot from it unless the menu was asked for.
++		if (!bootVolume.IsValid() && luks_has_locked_volumes()
++			&& luks_unlock_boot_volume(bootVolume) == B_OK
++			&& (platform_boot_options() & BOOT_OPTION_MENU) == 0) {
++			showMenu = false;
++		}
++#endif
++
++		if (showMenu && user_menu(bootVolume, pathBlocklist) < B_OK) {
+ 			// user requested to quit the loader
+ 			goto out;
+ 		}
+@@ -146,6 +160,11 @@ main(stage2_args *args)
+ 			if (gKernelArgs.ucode_data == NULL)
+ 				gKernelArgs.kernel_args_size = kernel_args_size_v1;
+ 
++#ifdef BOOT_SUPPORT_LUKS
++			// the key of an encrypted boot volume: the last field added
++			luks_add_boot_volume_key();
++#endif
++
+ 			// clone the boot_volume KMessage into kernel accessible memory
+ 			// note, that we need to 8-byte align the buffer and thus allocate
+ 			// 7 more bytes
+@@ -160,6 +179,11 @@ main(stage2_args *args)
+ 			gKernelArgs.boot_volume = buffer;
+ 			gKernelArgs.boot_volume_size = gBootParams.ContentSize();
+ 
++#ifdef BOOT_SUPPORT_LUKS
++			// the kernel has its copy of an encrypted boot volume's key now
++			luks_cleanup();
++#endif
++
+ 			platform_cleanup_devices();
+ 				// Further cleanup (e.g. heap_release) is the platform's responsibility.
+ 
+diff --git a/src/system/boot/loader/menu.cpp b/src/system/boot/loader/menu.cpp
+index e0713e2ba6..c594c8b9e6 100644
+--- a/src/system/boot/loader/menu.cpp
++++ b/src/system/boot/loader/menu.cpp
+@@ -31,6 +31,9 @@
+ 
+ #include "load_driver_settings.h"
+ #include "loader.h"
++#ifdef BOOT_SUPPORT_LUKS
++#	include "luks.h"
++#endif
+ #include "package_support.h"
+ #include "pager.h"
+ #include "RootFileSystem.h"
+@@ -1269,6 +1272,21 @@ add_boot_volume_item(Menu* menu, Directory* volume, const char* name)
+ }
+ 
+ 
++#ifdef BOOT_SUPPORT_LUKS
++static bool
++user_menu_unlock_volume(Menu* menu, MenuItem* item)
++{
++	Directory* volume = luks_unlock_menu_item(item);
++	if (volume != NULL && sBootVolume->SetTo(volume) == B_OK) {
++		// boot from it: like choosing it in the list
++		update_continue_booting_menu_item(B_OK);
++		item->SetLabel("Unlocked: \"Continue booting\" boots from it");
++	}
++	return true;
++}
++#endif
++
++
+ static Menu*
+ add_boot_volume_menu()
+ {
+@@ -1294,6 +1312,16 @@ add_boot_volume_menu()
+ 		gRoot->Close(cookie);
+ 	}
+ 
++#ifdef BOOT_SUPPORT_LUKS
++	int32 itemsBefore = menu->CountItems();
++	luks_add_menu_items(menu, user_menu_unlock_volume);
++	if (menu->CountItems() > itemsBefore && !sBootVolume->IsValid()) {
++		// nothing to boot yet: offer the first encrypted volume
++		menu->ItemAt(itemsBefore)->Select(true);
++	}
++	count += menu->CountItems() - itemsBefore;
++#endif
++
+ 	if (count == 0) {
+ 		// no boot volume found yet
+ 		menu->AddItem(item = new(nothrow) MenuItem("<No boot volume found>"));
+diff --git a/src/system/boot/loader/partitions.cpp b/src/system/boot/loader/partitions.cpp
+index dba0513f9c..c9cf011f0f 100644
+--- a/src/system/boot/loader/partitions.cpp
++++ b/src/system/boot/loader/partitions.cpp
+@@ -18,6 +18,9 @@
+ #include <ddm_modules.h>
+ 
+ #include "RootFileSystem.h"
++#ifdef BOOT_SUPPORT_LUKS
++#	include "luks.h"
++#endif
+ 
+ 
+ using namespace boot;
+@@ -109,7 +112,8 @@ Partition::Partition(int fd)
+ 	:
+ 	fParent(NULL),
+ 	fIsFileSystem(false),
+-	fIsPartitioningSystem(false)
++	fIsPartitioningSystem(false),
++	fIsEncrypted(false)
+ {
+ 	TRACE(("%p Partition::Partition\n", this));
+ 
+@@ -312,6 +316,9 @@ Partition::Scan(bool mountFileSystems, bool isBootDevice)
+ 
+ 	TRACE(("%p Partition::Scan()\n", this));
+ 
++	if (fIsEncrypted)
++		return B_OK;
++
+ 	// if we were not booted from the real boot device, we won't scan
+ 	// the device we were booted from (which is likely to be a slow
+ 	// floppy or CD)
+@@ -402,7 +409,8 @@ Partition::Scan(bool mountFileSystems, bool isBootDevice)
+ 
+ 			child->Scan(mountFileSystems);
+ 
+-			if (!mountFileSystems || child->IsFileSystem()) {
++			if (!mountFileSystems || child->IsFileSystem()
++				|| child->IsEncrypted()) {
+ 				// move the partitions containing file systems to the partition
+ 				// list
+ 				fChildren.Remove(child);
+@@ -427,6 +435,15 @@ Partition::Scan(bool mountFileSystems, bool isBootDevice)
+ 	if (mountFileSystems && bestFSModule != NULL)
+ 		return _Mount(bestFSModule, NULL);
+ 
++#ifdef BOOT_SUPPORT_LUKS
++	// neither a partition table nor a file system: maybe encrypted
++	if (mountFileSystems && luks_probe_partition(this)) {
++		fIsEncrypted = true;
++		content_type = "LUKS2";
++		return B_OK;
++	}
++#endif
++
+ 	return B_ENTRY_NOT_FOUND;
+ }
+ 
+@@ -461,7 +478,7 @@ add_partitions_for(int fd, bool mountFileSystems, bool isBootDevice)
+ 
+ 	// keep it, if it contains or might contain a file system
+ 	if ((partition->Scan(mountFileSystems, isBootDevice) == B_OK
+-			&& partition->IsFileSystem())
++			&& (partition->IsFileSystem() || partition->IsEncrypted()))
+ 		|| (!partition->IsPartitioningSystem() && !mountFileSystems)) {
+ 		return B_OK;
+ 	}
+diff --git a/src/system/boot/loader/vfs.cpp b/src/system/boot/loader/vfs.cpp
+index 5c2cbedbb0..c188d4f418 100644
+--- a/src/system/boot/loader/vfs.cpp
++++ b/src/system/boot/loader/vfs.cpp
+@@ -27,6 +27,9 @@
+ #include "package_support.h"
+ #include "RootFileSystem.h"
+ #include "file_systems/packagefs/packagefs.h"
++#ifdef BOOT_SUPPORT_LUKS
++#	include "luks.h"
++#endif
+ 
+ 
+ using namespace boot;
+@@ -688,6 +691,11 @@ register_boot_file_system(BootVolume& bootVolume)
+ 			offset);
+ 	}
+ 
++#ifdef BOOT_SUPPORT_LUKS
++	// an encrypted boot volume: the kernel gets its UUID and key
++	luks_register_boot_device(device);
++#endif
++
+ 	return platform_register_boot_device(device, &defaultDiskID);
+ }
+ 
+diff --git a/src/system/boot/platform/efi/start.cpp b/src/system/boot/platform/efi/start.cpp
+index 1e0bba45af..0ebcf168a1 100644
+--- a/src/system/boot/platform/efi/start.cpp
++++ b/src/system/boot/platform/efi/start.cpp
+@@ -238,6 +238,12 @@ efi_main(efi_handle image, efi_system_table *systemTable)
+ 	kImage = image;
+ 	kSystemTable = systemTable;
+ 	kBootServices = systemTable->BootServices;
++
++	// The firmware arms a 5 minute watchdog before starting a boot
++	// application, and resets the machine when it expires: someone who
++	// takes longer at the boot menu or at an encrypted volume's passphrase
++	// prompt would be rebooted. Like other boot loaders, switch it off.
++	kBootServices->SetWatchdogTimer(0, 0, 0, NULL);
+ 	kRuntimeServices = systemTable->RuntimeServices;
+ 
+ 	call_ctors();
+diff --git a/src/system/kernel/fs/Jamfile b/src/system/kernel/fs/Jamfile
+index 2cf67ae0f8..a1c56d0d58 100644
+--- a/src/system/kernel/fs/Jamfile
++++ b/src/system/kernel/fs/Jamfile
+@@ -4,6 +4,7 @@ UsePrivateHeaders [ FDirName kernel disk_device_manager ] ;
+ UsePrivateHeaders [ FDirName kernel fs ] ;
+ UsePrivateHeaders [ FDirName kernel util ] ;
+ UsePrivateHeaders net shared storage file_systems ;
++UsePrivateHeaders luks2 ;
+ 
+ UseHeaders [ FDirName $(SUBDIR) $(DOTDOT) device_manager ] ;
+ 
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 45e7fb785a..36dec3196e 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -11,6 +11,7 @@
+ #include "vfs_boot.h"
+ 
+ #include <stdio.h>
++#include <string.h>
+ #include <strings.h>
+ 
+ #include <fs_info.h>
+@@ -25,6 +26,7 @@
+ #include <file_cache.h>
+ #include <fs/KPath.h>
+ #include <kmodule.h>
++#include <luks2_driver.h>
+ #include <syscalls.h>
+ #include <util/KMessage.h>
+ #include <util/Stack.h>
+@@ -61,6 +63,20 @@ dev_t gBootDevice = -1;
+ bool gReadOnlyBootDevice = false;
+ 
+ 
++// Volume keys of encrypted (LUKS2) boot volumes the boot loader unlocked;
++// wiped as soon as the boot volume is mounted.
++struct BootVolumeKey {
++	char	uuid[40];
++	uint8	key[64];
++	size_t	keySize;
++	bool	opened;
++};
++
++static const int32 kMaxBootVolumeKeys = 4;
++static BootVolumeKey sBootVolumeKeys[kMaxBootVolumeKeys];
++static int32 sBootVolumeKeyCount = 0;
++
++
+ /*!	No image was chosen - prefer disks with names like "Haiku", or "System"
+  */
+ int
+@@ -320,6 +336,137 @@ DiskBootMethod::SortPartitions(KPartition** partitions, int32 count)
+ // #pragma mark -
+ 
+ 
++static void
++wipe_boot_volume_keys()
++{
++	volatile uint8* bytes = (volatile uint8*)sBootVolumeKeys;
++	for (size_t i = 0; i < sizeof(sBootVolumeKeys); i++)
++		bytes[i] = 0;
++	sBootVolumeKeyCount = 0;
++}
++
++
++/*!	Copies the volume keys the boot loader passed for encrypted boot volumes
++	and wipes them in the boot volume message (kernel args memory, which is
++	freed later without being cleared). */
++static void
++take_boot_volume_keys(KMessage& bootVolume)
++{
++	for (int32 i = 0; i < kMaxBootVolumeKeys; i++) {
++		const void* key;
++		int32 keySize;
++		if (bootVolume.FindData(BOOT_VOLUME_LUKS_KEY, B_RAW_TYPE, i, &key,
++				&keySize) != B_OK) {
++			break;
++		}
++
++		const char* uuid;
++		if (bootVolume.FindString(BOOT_VOLUME_LUKS_UUID, i, &uuid) == B_OK
++			&& keySize > 0 && keySize <= (int32)sizeof(BootVolumeKey::key)) {
++			BootVolumeKey& entry = sBootVolumeKeys[sBootVolumeKeyCount++];
++			strlcpy(entry.uuid, uuid, sizeof(entry.uuid));
++			memcpy(entry.key, key, keySize);
++			entry.keySize = keySize;
++			entry.opened = false;
++		}
++
++		volatile uint8* bytes = (volatile uint8*)key;
++		for (int32 j = 0; j < keySize; j++)
++			bytes[j] = 0;
++	}
++
++	if (sBootVolumeKeyCount > 0) {
++		dprintf("vfs_boot: %" B_PRId32 " encrypted boot volume(s) unlocked by "
++			"the boot loader\n", sBootVolumeKeyCount);
++	}
++}
++
++
++/*!	Opens the encrypted volumes the boot loader unlocked with the keys it
++	passed, through the luks_disk driver, which checks each key against the
++	volume's header. The partitions are found by the LUKS2 UUID in their
++	primary header. Returns whether a volume was opened (and the devices
++	need another scan).
++*/
++static bool
++open_encrypted_boot_volumes(KDiskDeviceManager* manager)
++{
++	bool pending = false;
++	for (int32 i = 0; i < sBootVolumeKeyCount; i++)
++		pending |= !sBootVolumeKeys[i].opened;
++	if (!pending)
++		return false;
++
++	luks2_boot_module_info* luks;
++	if (get_module(LUKS2_BOOT_MODULE_NAME, (module_info**)&luks) != B_OK) {
++		dprintf("vfs_boot: no luks_disk driver for the encrypted boot "
++			"volume\n");
++		return false;
++	}
++
++	struct LUKSVisitor : KPartitionVisitor {
++		LUKSVisitor(luks2_boot_module_info* luks)
++			: fLUKS(luks), fOpened(false) {}
++
++		virtual bool VisitPre(KPartition* partition)
++		{
++			if (partition->CountChildren() > 0
++				|| partition->ContainsFileSystem()) {
++				return false;
++			}
++
++			uint8 header[512];
++			if (read_pos(partition->Device()->FD(), partition->Offset(),
++					header, sizeof(header)) != (ssize_t)sizeof(header)) {
++				return false;
++			}
++			static const uint8 kMagic[] = { 'L', 'U', 'K', 'S', 0xba, 0xbe,
++				0, 2 };
++			if (memcmp(header, kMagic, sizeof(kMagic)) != 0)
++				return false;
++			char uuid[40];
++			memcpy(uuid, header + 168, sizeof(uuid));
++			uuid[sizeof(uuid) - 1] = '\0';
++
++			for (int32 i = 0; i < sBootVolumeKeyCount; i++) {
++				BootVolumeKey& entry = sBootVolumeKeys[i];
++				if (entry.opened || strcmp(entry.uuid, uuid) != 0)
++					continue;
++
++				KPath path;
++				if (partition->GetPath(&path) != B_OK)
++					return false;
++				char device[B_PATH_NAME_LENGTH];
++				status_t status = fLUKS->open_volume(path.Path(), entry.key,
++					entry.keySize, device, sizeof(device));
++				if (status == B_OK) {
++					dprintf("vfs_boot: encrypted boot volume %s opened as "
++						"%s\n", path.Path(), device);
++					entry.opened = true;
++					fOpened = true;
++				} else {
++					dprintf("vfs_boot: opening encrypted volume %s failed: "
++						"%s\n", path.Path(), strerror(status));
++				}
++			}
++			return false;
++		}
++
++		luks2_boot_module_info*	fLUKS;
++		bool					fOpened;
++	} visitor(luks);
++
++	KDiskDevice* device;
++	int32 cookie = 0;
++	while ((device = manager->NextDevice(&cookie)) != NULL)
++		device->VisitEachDescendant(&visitor);
++
++	put_module(LUKS2_BOOT_MODULE_NAME);
++		// the module is B_KEEP_LOADED
++	return visitor.fOpened;
++}
++
++
+ /*!	Make the boot partition (and probably others) available.
+ 	The partitions that are a boot candidate a put into the /a partitions
+ 	stack. If the user selected a boot device, there is will only be one
+@@ -367,6 +514,10 @@ get_boot_partitions(KMessage& bootVolume, PartitionStack& partitions)
+ 		// may be usuable anyway, so don't fail here.
+ 	}
+ 
++	// an encrypted boot volume is a new device once it is open
++	if (open_encrypted_boot_volumes(manager))
++		manager->InitialDeviceScan();
++
+ #if KDEBUG
+ 	// dump devices and partitions
+ 	KDiskDevice *device;
+@@ -471,6 +622,7 @@ vfs_mount_boot_file_system(kernel_args* args)
+ {
+ 	KMessage bootVolume;
+ 	bootVolume.SetTo(args->boot_volume, args->boot_volume_size);
++	take_boot_volume_keys(bootVolume);
+ 
+ 	PartitionStack partitions;
+ 	status_t status = get_boot_partitions(bootVolume, partitions);
+@@ -510,6 +662,9 @@ vfs_mount_boot_file_system(kernel_args* args)
+ 		}
+ 	}
+ 
++	// the encrypted boot volume is open: the keys aren't needed any more
++	wipe_boot_volume_keys();
++
+ 	if (bootDevice < B_OK)
+ 		panic("could not mount boot device!\n");
+ 
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+new file mode 100644
+index 0000000000..52602aae3f
+--- /dev/null
++++ b/src/tests/system/luks2/README.md
+@@ -0,0 +1,55 @@
++# LUKS2 tests
++
++The LUKS2 code (`src/libs/luks2`), the `luks_disk` driver, the boot loader's
++unlocking and the `luks` command. The crypto code is unreviewed: keep backups
++of anything on an encrypted volume.
++
++## On the build host (Linux)
++
++`run_tests.sh <cryptsetup> <work dir>` builds the code with the host
++compiler twice (optimised, and with AddressSanitizer and
++UndefinedBehaviorSanitizer) and runs:
++
++- `crypto_test vectors`: FIPS-197 (AES, portable and AES-NI), IEEE 1619
++  (XTS), FIPS 180-4 (SHA-256/512), RFC 7914 (PBKDF2), RFC 7693 (BLAKE2b),
++  RFC 9106 (Argon2d/i/id);
++- `crypto_crosscheck.py`: random XTS, PBKDF2 and Argon2 inputs against
++  OpenSSL (Python's `cryptography`, `hashlib`, `openssl kdf`);
++- `cryptsetup_test.sh`: 40 interoperability tests with Linux's cryptsetup in
++  both directions (both KDFs and their parameters, several keyslots,
++  priorities, killed slots, damaged headers, LUKS1 and interrupted
++  reencryptions refused, data encrypted by cryptsetup decrypted byte for
++  byte, our data decrypted with cryptsetup's volume key and OpenSSL);
++- `crypto_test benchmark`.
++
++cryptsetup works on image files without root; only `--disable-locks` is
++needed. `build_host.sh` alone builds the host `luks`, which also makes
++encrypted images (`luks format`, then `luks write`).
++
++## In QEMU (x86_64, UEFI)
++
++Both need an anyboot image built with these changes, OVMF (`/usr/share/OVMF`), the
++host `luks`, `bfs_shell` from the build directory and cryptsetup. QEMU runs in
++software emulation (`-cpu max` emulates AES-NI).
++
++- `qemu/run-driver-test.sh`: the driver and the tool on NVMe test disks
++  (`qemu/guest-driver-test.sh` runs in Haiku at boot): a volume cryptsetup
++  encrypted, writes onto a cryptsetup volume (checked on the host with
++  cryptsetup's key), a volume formatted on Haiku with BFS inside, reopened,
++  read-only, keyslots added and removed on Haiku and checked by cryptsetup.
++- `qemu/run-boot-test.sh`: an encrypted system volume: a GPT disk with an ESP
++  holding the new `haiku_loader.efi` and a LUKS2 partition holding the
++  system BFS volume. `qemu/boot_console.py` types the passphrase into the
++  boot loader through OVMF's serial console, saves the guest's RAM after
++  boot, and drives the boot menu. Boot 1 with AES-NI, boot 2 with a wrong
++  passphrase first and without AES-NI, boot 3 through the boot menu's
++  "Unlock encrypted volume" item; the RAM after boots 1 and 2 must hold no
++  copy of the volume key; the host reads back what Haiku wrote.
++
++## arm64
++
++`arm64_compile_check.sh <generated.arm64> <out dir>` compiles every LUKS2
++source for arm64 with the cross compiler of an arm64 build directory and
++the flags of each
++context (kernel add-on, kernel, EFI boot loader, userland), `-Werror`,
++without building anything in the arm64 build directory.
+diff --git a/src/tests/system/luks2/arm64_compile_check.sh b/src/tests/system/luks2/arm64_compile_check.sh
+new file mode 100755
+index 0000000000..3cf56869ad
+--- /dev/null
++++ b/src/tests/system/luks2/arm64_compile_check.sh
+@@ -0,0 +1,125 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Compiles the LUKS2 sources for arm64 with the cross compiler of an arm64
++# build directory, file by file, with the flags of each context (kernel add-on, kernel, EFI
++# boot loader, userland), without building anything in the arm64 build
++# directory (its cross tools and its generated headers are only read).
++# A portability check for the arm64 milestone; nothing is linked.
++#
++# Usage: arm64_compile_check.sh <generated.arm64 dir> <output dir>
++
++G=$(cd "$1" && pwd)
++O=$2
++R=$(cd "$(dirname "$0")/../../../.." && pwd)
++CC=$G/cross-tools-arm64/bin/aarch64-unknown-haiku-gcc
++SYSLIBS=$(ls -d "$G"/build_packages/gcc_syslibs_devel-*-arm64 | head -1)/develop/headers
++mkdir -p "$O"
++
++common="-Wall -Wno-multichar -Wpointer-arith -Wsign-compare -Werror
++	-Wno-error=unused-but-set-variable -Wno-error=cpp
++	-Wno-error=address-of-packed-member -fno-strict-aliasing
++	-fno-delete-null-pointer-checks -nostdinc
++	-march=armv8-a+crc -mfix-cortex-a53-835769 -mfix-cortex-a53-843419
++	-DARCH_arm64 -D__HAIKU_PRIMARY_PACKAGING_ARCH=\"arm64\"
++	-DHAIKU_DISTRO_COMPATIBILITY_DEFAULT -DHAIKU_TARGET_PLATFORM_HAIKU
++	-DHAIKU_REGULAR_BUILD"
++os=""
++for d in "" add-ons add-ons/file_system add-ons/graphics app device drivers \
++		interface kernel storage support; do
++	os="$os -I$R/headers/os/$d"
++done
++headers="-I$R/headers/private -I$R/headers/private/kernel
++	-I$R/headers/private/libroot -I$R/headers/private/shared
++	-I$R/headers/private/kernel/boot/platform/efi
++	-I$R/headers/private/kernel/arch/arm64
++	-I$G/objects/haiku/arm64/common/system/kernel
++	-I$R/headers/private/system -I$R/headers/private/system/arch/arm64
++	-I$SYSLIBS/c++ -I$SYSLIBS/c++/aarch64-unknown-haiku
++	-I$R/headers/glibc -I$R/headers/posix
++	-I$SYSLIBS/gcc/include -I$SYSLIBS/gcc/include-fixed
++	-I$R/headers $os -I$R/build/config_headers"
++kernel="-O2 -ffreestanding -finline -fno-semantic-interposition
++	-fno-tree-vectorize -fno-exceptions -fno-use-cxa-atexit -fpic
++	-D_KERNEL_MODE"
++boot="-Os -ffreestanding -fno-rtti
++	-include $R/headers/private/kernel/util/kernel_cpp.h
++	-fno-tree-vectorize -fno-exceptions -fno-use-cxa-atexit -fpic
++	-fno-stack-protector -fshort-wchar -D_KERNEL_MODE -D_BOOT_MODE
++	-DBOOT_ARCH=\"arm64\" -DKMESSAGE_CONTAINER_ONLY
++	-DBOOT_SUPPORT_PARTITION_INTEL -DBOOT_SUPPORT_PARTITION_EFI
++	-DBOOT_SUPPORT_FILE_SYSTEM_BFS -DBOOT_SUPPORT_FILE_SYSTEM_TARFS
++	-DBOOT_SUPPORT_FILE_SYSTEM_FAT -D_BOOT_PLATFORM_EFI -DBOOT_SUPPORT_LUKS
++	-DBOOT_SUPPORT_ELF64
++	-I$R/src/system/boot/loader -I$R/headers/private/kernel/disk_device_manager
++	-I$R/headers/private/kernel/util -I$R/headers/private/storage
++	-I$R/src/add-ons/kernel/partitioning_systems/gpt
++	-I$R/src/add-ons/kernel/partitioning_systems/intel"
++user="-O2"
++
++L=$R/src/libs/luks2
++library="$L/json.cpp $L/luks2_read.cpp $L/luks2_util.cpp $L/crypto/aes_ct.c
++	$L/crypto/aes_xts.cpp $L/crypto/argon2.cpp $L/crypto/sha2_hmac.cpp"
++
++passed=0
++failed=0
++# flags C doesn't take
++cplusplus="-Wno-ctor-dtor-privacy -Woverloaded-virtual -fno-rtti
++	-fno-use-cxa-atexit -include $R/headers/private/kernel/util/kernel_cpp.h"
++compile() {
++	# compile <context> <flags> <source>
++	out="$O/$1-$(basename "$3").o"
++	flags="$2"
++	case "$3" in
++		*.c)
++			for flag in $cplusplus; do
++				flags=$(echo "$flags" | tr '\t\n' '  ' | sed "s#$flag##g; s#-include ##g")
++			done
++			;;
++		*)
++			flags="$flags -Wno-ctor-dtor-privacy -Woverloaded-virtual"
++			;;
++	esac
++	if $CC -c $common $headers $flags "$3" -o "$out" 2> "$out.log"; then
++		passed=$((passed + 1))
++		echo "ok   $1: ${3#$R/}"
++	else
++		failed=$((failed + 1))
++		echo "FAIL $1: ${3#$R/}"
++		sed 's/^/     /' "$out.log" | head -20
++	fi
++}
++
++for f in $library; do
++	compile kernel "$kernel" "$f"
++	compile boot "$boot" "$f"
++	compile user "$user" "$f"
++done
++compile user "$user" "$L/luks2_write.cpp"
++compile user "$user" "$R/src/bin/luks/luks.cpp"
++compile kernel "$kernel -I$R/src/system/kernel/device_manager" \
++	"$R/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp"
++compile kernel "$kernel -I$R/headers/private/luks2
++	-I$R/headers/private/kernel/disk_device_manager
++	-I$R/headers/private/kernel/fs -I$R/headers/private/kernel/util
++	-I$R/headers/private/net -I$R/headers/private/storage
++	-I$R/headers/private/file_systems -I$R/src/system/kernel/device_manager" \
++	"$R/src/system/kernel/fs/vfs_boot.cpp"
++for f in luks.cpp partitions.cpp main.cpp menu.cpp vfs.cpp; do
++	compile boot "$boot" "$R/src/system/boot/loader/$f"
++done
++compile boot "$boot -I$R/headers/private/kernel/platform
++	-I$R/src/system/boot/platform/efi" "$R/src/system/boot/platform/efi/start.cpp"
++
++# no AES accelerator is compiled in on arm64 yet: the portable AES only
++for o in "$O"/*aes_xts.cpp.o; do
++	if "$G"/cross-tools-arm64/bin/aarch64-unknown-haiku-nm "$o" \
++			| grep -q luks2_aes_accel; then
++		echo "FAIL $(basename "$o") refers to an accelerator"
++		failed=$((failed + 1))
++	fi
++done
++
++echo "$passed compiled, $failed failed"
++[ $failed -eq 0 ]
+diff --git a/src/tests/system/luks2/qemu/boot_console.py b/src/tests/system/luks2/qemu/boot_console.py
+new file mode 100755
+index 0000000000..c29d83e6d3
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/boot_console.py
+@@ -0,0 +1,150 @@
++#!/usr/bin/env python3
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Drives a QEMU guest's serial console for run-boot-test.sh: types the
++# passphrase when the boot loader asks for it (optionally a wrong one
++# first), and when the guest says so, pauses the VM and saves its RAM to a
++# file through the QEMU monitor. Logs everything it reads.
++#
++# Usage: boot_console.py <serial socket> <monitor socket> <log>
++#            <passphrase file> [--wrong-first | --menu]
++#            [--dump <file> <bytes>] [--timeout <seconds>]
++# --menu: Esc at the passphrase prompt, then unlock through the boot menu
++# ("Select boot volume/state", "Unlock encrypted volume ...", the
++# passphrase, "Continue booting").
++
++import os
++import socket
++import sys
++import time
++
++serial_path, monitor_path, log_path, passphrase_path = sys.argv[1:5]
++options = sys.argv[5:]
++wrong_first = "--wrong-first" in options
++menu_steps = None
++if "--menu" in options:
++    # (text to wait for, bytes to send), in order
++    menu_steps = [(b"Passphrase (Esc", b"\x1b"),
++                  (b"Select boot volume/state", b"\r"),
++                  (b"Unlock encrypted volume", b"\r"),
++                  (b"Passphrase (Esc", None),
++                  (b"Continue booting", b"\r")]
++dump = None
++if "--dump" in options:
++    i = options.index("--dump")
++    dump = (options[i + 1], int(options[i + 2], 0))
++timeout = 3600
++if "--timeout" in options:
++    timeout = int(options[options.index("--timeout") + 1])
++
++with open(passphrase_path, "rb") as f:
++    passphrase = f.read()
++
++
++def connect(path):
++    deadline = time.time() + 30
++    while True:
++        try:
++            s = socket.socket(socket.AF_UNIX)
++            s.connect(path)
++            return s
++        except OSError:
++            if time.time() > deadline:
++                raise
++            time.sleep(0.2)
++
++
++def monitor(command):
++    s = connect(monitor_path)
++    s.settimeout(120)
++    s.sendall((command + "\n").encode())
++    data = b""
++    # the reply ends with the next prompt
++    while data.count(b"(qemu)") < 2:
++        chunk = s.recv(65536)
++        if not chunk:
++            break
++        data += chunk
++    s.close()
++    return data.decode("utf-8", "replace")
++
++
++def type_text(s, text):
++    for byte in text:
++        s.sendall(bytes([byte]))
++        time.sleep(0.03)
++
++
++serial = connect(serial_path)
++serial.settimeout(1.0)
++log = open(log_path, "wb")
++seen = b""
++scan_from = 0
++prompts = 0
++sent_wrong = False
++dumped = False
++start = time.time()
++
++while time.time() - start < timeout:
++    try:
++        chunk = serial.recv(65536)
++        if not chunk:
++            break
++    except socket.timeout:
++        chunk = b""
++    if chunk:
++        log.write(chunk)
++        log.flush()
++        seen += chunk
++
++    if menu_steps:
++        text, send = menu_steps[0]
++        found = seen.find(text, scan_from)
++        if found >= 0:
++            scan_from = found + len(text)
++            menu_steps.pop(0)
++            time.sleep(1.5)
++            if send is None:
++                send = passphrase + b"\r"
++                prompts += 1
++            print("console: menu step: found %r, typing %s" % (text,
++                  "the passphrase" if send.startswith(passphrase) else
++                  repr(send)), flush=True)
++            type_text(serial, send)
++        found = -1
++    else:
++        found = seen.find(b"Passphrase (Esc", scan_from)
++    if found >= 0:
++        scan_from = found + 1
++        prompts += 1
++        time.sleep(0.5)
++        if wrong_first and not sent_wrong:
++            print("console: typing a wrong passphrase", flush=True)
++            type_text(serial, b"not the right one\r")
++            sent_wrong = True
++        else:
++            print("console: typing the passphrase (prompt %d)" % prompts,
++                  flush=True)
++            type_text(serial, passphrase + b"\r")
++
++    if dump is not None and not dumped \
++            and b"LUKSTEST memory-dump-now" in seen:
++        dumped = True
++        print("console: saving the guest's RAM", flush=True)
++        for command in ("stop", "pmemsave 0 %d %s" % (dump[1], dump[0]),
++                "cont"):
++            reply = monitor(command)
++            print("console: monitor %s: %s" % (command.split()[0],
++                  " ".join(reply.split()[-12:])), flush=True)
++        print("console: RAM saved", flush=True)
++
++    # keep the search window small
++    if len(seen) > 1 << 20:
++        cut = len(seen) - 65536
++        seen = seen[cut:]
++        scan_from = max(0, scan_from - cut)
++
++log.close()
++print("console: done after %d s, %d passphrase prompt(s)"
++      % (time.time() - start, prompts), flush=True)
+diff --git a/src/tests/system/luks2/qemu/guest-boot-test.sh b/src/tests/system/luks2/qemu/guest-boot-test.sh
+new file mode 100755
+index 0000000000..7d66bb1fd2
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/guest-boot-test.sh
+@@ -0,0 +1,80 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# The guest half of run-boot-test.sh: runs at boot from the encrypted system
++# volume (a launch job), checks that /boot is the decrypted device the
++# kernel opened with the boot loader's key, writes a marker for the next
++# boot, lets the host save the RAM, and powers off.
++
++T=/boot/system/settings/luks-test
++passed=0
++failed=0
++
++log() { echo "LUKSTEST $*" > /dev/dprintf; }
++ok() { passed=$((passed + 1)); log "ok   $*"; }
++bad() { failed=$((failed + 1)); log "FAIL $*"; }
++run() {
++	out=$("$@" 2>&1)
++	status=$?
++	echo "$out" | while read -r line; do log "   | $line"; done
++	return $status
++}
++
++log "start: $(uname -srvm)"
++sleep 5
++
++boots=$(cat /boot/home/luks-boot-count 2>/dev/null || echo 0)
++boots=$((boots + 1))
++log "boot number $boots of this encrypted volume"
++
++run df /boot
++device=$(df /boot | sed -n 's/^ *Device: *//p')
++case "$device" in
++	/dev/disk/virtual/luks/*)
++		ok "/boot is on the decrypted device $device"
++		;;
++	*)
++		bad "/boot is on $device"
++		;;
++esac
++run luks list
++luks list | grep -q "UUID $(cat $T/uuid)" && ok "luks list shows the boot volume" \
++	|| bad "luks list"
++
++# the kernel opened it with the loader's key: no prompt, no KDF in the kernel
++if grep -q "vfs_boot: encrypted boot volume .* opened as" /var/log/syslog; then
++	ok "the kernel opened the volume with the boot loader's key"
++else
++	bad "no vfs_boot line in the syslog"
++fi
++grep -E "vfs_boot|luks" /var/log/syslog | head -20 \
++	| while read -r line; do log "   | $line"; done
++
++# this volume is in use: closing it must be refused
++if luks close "$device" > /dev/null 2>&1; then
++	bad "the boot volume could be closed"
++else
++	ok "closing the boot volume is refused"
++fi
++
++# writing to the encrypted system volume
++if [ $boots -gt 1 ]; then
++	if [ "$(cat /boot/home/luks-boot-marker)" = "written at boot $((boots - 1))" ]; then
++		ok "the marker written at the previous boot is there"
++	else
++		bad "marker: $(cat /boot/home/luks-boot-marker 2>&1)"
++	fi
++fi
++echo "written at boot $boots" > /boot/home/luks-boot-marker
++echo $boots > /boot/home/luks-boot-count
++head -c $((16 * 1024 * 1024)) /dev/urandom > /boot/home/luks-random.bin
++sha256sum /boot/home/luks-random.bin | cut -d' ' -f1 > /boot/home/luks-random.sha256
++sync
++ok "16 MiB written to /boot/home"
++
++log "done: $passed passed, $failed failed"
++log "memory-dump-now"
++sleep 20
++sync
++shutdown -q
+diff --git a/src/tests/system/luks2/qemu/run-boot-test.sh b/src/tests/system/luks2/qemu/run-boot-test.sh
+new file mode 100755
+index 0000000000..a961daf1ce
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/run-boot-test.sh
+@@ -0,0 +1,216 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Boots an encrypted Haiku system volume in QEMU (x86_64, UEFI/OVMF, NVMe):
++# a GPT disk with an EFI system partition holding the new boot loader and a
++# LUKS2 partition holding the system BFS volume (taken from an anyboot
++# image). The boot loader must ask for the passphrase, boot from the
++# decrypted volume and hand the key to the kernel, which mounts the same
++# volume without asking again.
++#  - boot 1: the right passphrase, AES-NI; the guest's RAM is saved after
++#    boot and searched for leftover copies of the volume key and the
++#    passphrase;
++#  - boot 2: a wrong passphrase first, then the right one, without AES-NI
++#    (the portable AES in the loader and the kernel); the file written at
++#    boot 1 must be there; RAM searched again;
++#  - boot 3: Esc at the prompt, then "Unlock encrypted volume" in the boot
++#    menu, and "Continue booting";
++#  - boot 4: with the passphrase of a keyslot cryptsetup added (argon2id,
++#    512 MiB, 4 lanes: four 128 MiB allocations in the boot loader).
++# Then the build host decrypts the volume and checks what Haiku wrote.
++#
++# Usage: run-boot-test.sh <anyboot image> <haiku_loader.efi> <work dir>
++#            <host luks> <bfs_shell> <cryptsetup> [timeout seconds]
++
++set -e
++IMAGE=$1
++LOADER=$2
++W=$3
++LUKS=$4
++BFS=$5
++CS=$6
++TIMEOUT=${7:-3600}
++HERE=$(cd "$(dirname "$0")" && pwd)
++mkdir -p "$W"
++cd "$W"
++
++passed=0
++failed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++bad() { failed=$((failed + 1)); echo "FAIL $*"; }
++
++echo "== the system volume"
++offset=$(sfdisk -d "$IMAGE" | sed -n 's/.*1 : start= *\([0-9]*\),.*/\1/p')
++size=$(sfdisk -d "$IMAGE" | sed -n 's/.*1 : start= *[0-9]*, size= *\([0-9]*\),.*/\1/p')
++dd if="$IMAGE" of=system.bfs bs=512 skip=$offset count=$size 2>/dev/null
++cat > luks-test.job <<'JOB'
++job x-vnd.luks-test {
++	launch /bin/sh /boot/system/settings/luks-test/test.sh
++}
++JOB
++cp "$HERE/guest-boot-test.sh" test.sh
++printf 'correct horse battery staple, encrypted Haiku' > key
++
++echo "== the LUKS2 partition"
++luksSize=$((size * 512 + 16 * 1024 * 1024))
++rm -f luks.img
++truncate -s $luksSize luks.img
++"$LUKS" format -y -k key -L Haiku --pbkdf argon2id --memory 65536 --time 4 \
++	--parallel 4 --digest-iterations 20000 luks.img
++uuid=$("$LUKS" dump luks.img | sed -n 's/^  UUID: *//p')
++echo "$uuid" > uuid
++printf '%s\n' \
++	"mkdir -p /myfs/system/settings/luks-test" \
++	"mkdir -p /myfs/system/settings/launch" \
++	"cp :$W/test.sh /myfs/system/settings/luks-test/test.sh" \
++	"cp :$W/uuid /myfs/system/settings/luks-test/uuid" \
++	"cp :$W/luks-test.job /myfs/system/settings/launch/luks-test" \
++	"sync" "quit" | "$BFS" system.bfs > bfs_shell.log 2>&1
++"$LUKS" write -k key luks.img system.bfs
++"$LUKS" dump luks.img
++
++echo "== the disk: GPT, EFI system partition, LUKS2 partition"
++rm -f disk.img esp.img
++espSectors=$((64 * 2048))
++luksSectors=$((luksSize / 512))
++truncate -s $(( (2048 + espSectors + luksSectors + 2048) * 512 )) disk.img
++sgdisk -n 1:2048:+$espSectors -t 1:ef00 -c 1:"EFI system" \
++	-n 2:$((2048 + espSectors)):+$luksSectors -t 2:8309 \
++	-c 2:"Haiku (encrypted)" disk.img > /dev/null
++truncate -s $((espSectors * 512)) esp.img
++mformat -i esp.img -F -v EFI ::
++mmd -i esp.img ::/EFI ::/EFI/BOOT
++mcopy -i esp.img "$LOADER" ::/EFI/BOOT/BOOTX64.EFI
++dd if=esp.img of=disk.img bs=512 seek=2048 conv=notrunc 2>/dev/null
++dd if=luks.img of=disk.img bs=1M seek=$(( (2048 + espSectors) * 512 / 1048576 )) \
++	conv=notrunc 2>/dev/null
++sgdisk -p disk.img
++
++volumeKey=$("$CS" luksDump -q --disable-locks --dump-volume-key --key-file key \
++	luks.img | sed -n '/MK dump/,$p' | sed 's/MK dump://' | tr -d ' \t\n')
++
++boot() {
++	# boot <name> <cpu> <console options...>
++	name=$1
++	cpu=$2
++	shift 2
++	cp /usr/share/OVMF/OVMF_VARS_4M.fd vars-$name.fd
++	rm -f serial-$name.sock monitor-$name.sock
++	start=$(date +%s)
++	timeout "$TIMEOUT" qemu-system-x86_64 -M q35 -cpu "$cpu" -smp 4 -m 2048 \
++		-accel tcg,thread=multi \
++		-drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
++		-drive if=pflash,format=raw,file=vars-$name.fd \
++		-drive if=none,id=disk,file=disk.img,format=raw \
++		-device nvme,drive=disk,serial=encrypted \
++		-nic none -display none -no-reboot \
++		-chardev socket,id=ser0,path=serial-$name.sock,server=on,wait=on \
++		-serial chardev:ser0 \
++		-monitor unix:monitor-$name.sock,server,nowait \
++		> qemu-$name.log 2>&1 &
++	qemu=$!
++	python3 -I "$HERE/boot_console.py" serial-$name.sock monitor-$name.sock \
++		serial-$name.log "$KEYFILE" "$@" --timeout "$TIMEOUT" || true
++	wait $qemu || echo "QEMU exited with $?"
++	echo "boot $name took $(( $(date +%s) - start )) s"
++	grep -a "LUKSTEST" serial-$name.log | sed 's/^.*LUKSTEST /guest: /'
++	grep -a -E "luks: |vfs_boot: |PANIC|panic\(" serial-$name.log | head -20
++	if grep -a -q "LUKSTEST done: [0-9]* passed, 0 failed" serial-$name.log; then
++		ok "boot $name: the guest's checks passed"
++	else
++		bad "boot $name: the guest's checks"
++	fi
++}
++
++KEYFILE=key
++echo "== boot 1: the passphrase, AES-NI, then the RAM is searched"
++rm -f memory.bin
++boot first max --dump memory.bin 0x80000000
++grep -a -c "Passphrase (Esc" serial-first.log > prompts-first || true
++[ "$(cat prompts-first)" -ge 1 ] && ok "the boot loader asked for the passphrase" \
++	|| bad "no passphrase prompt"
++search_memory() {
++	# search_memory <name>: no copy of the whole volume key may be left
++	if [ -s memory.bin ]; then
++		if python3 -I search.py memory.bin "$volumeKey" key; then
++			ok "boot $1: no copy of the whole volume key in the guest's RAM"
++		else
++			bad "boot $1: the volume key is still in the guest's RAM"
++		fi
++		rm -f memory.bin
++	else
++		bad "boot $1: no RAM dump"
++	fi
++}
++cat > search.py <<'PY'
++import mmap, sys
++with open(sys.argv[1], "rb") as f:
++    memory = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
++key = bytes.fromhex(sys.argv[2])
++passphrase = open(sys.argv[3], "rb").read()
++def count(needle):
++    n, i = 0, memory.find(needle)
++    while i >= 0:
++        n += 1
++        i = memory.find(needle, i + 1)
++    return n
++print("RAM: whole volume key %d, data key half %d, tweak key half %d, "
++      "passphrase %d" % (count(key), count(key[:32]), count(key[32:]),
++      count(passphrase)))
++sys.exit(1 if count(key) else 0)
++PY
++search_memory first
++
++echo "== boot 2: a wrong passphrase first, portable AES"
++boot second max,-aes --wrong-first --dump memory.bin 0x80000000
++search_memory second
++grep -a -q "doesn't open this volume" serial-second.log \
++	&& ok "the wrong passphrase was refused, and asked again" \
++	|| bad "no retry after the wrong passphrase"
++grep -a -q "portable constant-time" serial-second.log \
++	&& ok "without AES-NI, the portable AES was used" \
++	|| bad "the portable AES wasn't used"
++
++echo "== boot 3: Esc at the prompt, unlocked through the boot menu"
++boot third max --menu
++grep -a -q "Unlock encrypted volume" serial-third.log \
++	&& ok "the boot menu offered to unlock the volume" \
++	|| bad "no unlock item in the boot menu"
++
++echo "== boot 4: a keyslot cryptsetup added, argon2id with 512 MiB"
++luksStart=$(( (2048 + espSectors) * 512 / 1048576 ))
++dd if=disk.img of=luks-cs.img bs=1M skip=$luksStart count=$((luksSize / 1048576)) \
++	2>/dev/null
++printf "cryptsetup's keyslot, 512 MiB of Argon2" > key-cs
++"$CS" luksAddKey -q --disable-locks --key-file key --new-key-slot 5 \
++	--pbkdf argon2id --pbkdf-memory 524288 --pbkdf-parallel 4 \
++	--pbkdf-force-iterations 4 luks-cs.img key-cs
++dd if=luks-cs.img of=disk.img bs=1M seek=$luksStart count=16 conv=notrunc \
++	2>/dev/null
++rm -f luks-cs.img
++KEYFILE=key-cs
++boot fourth max
++grep -a -q 'opened with keyslot 5' serial-fourth.log \
++	&& ok "the boot loader opened cryptsetup's 512 MiB argon2id keyslot" \
++	|| bad "keyslot 5"
++
++echo "== what Haiku wrote, read back on the build host"
++dd if=disk.img of=luks-back.img bs=1M skip=$(( (2048 + espSectors) * 512 / 1048576 )) \
++	count=$((luksSize / 1048576)) 2>/dev/null
++rm -f system-back.bfs
++"$LUKS" read -k key luks-back.img system-back.bfs
++printf '%s\n' "cp /myfs/home/luks-random.bin :$W/random-back.bin" \
++	"cp /myfs/home/luks-random.sha256 :$W/random-back.sha256" \
++	"cp /myfs/home/luks-boot-marker :$W/marker-back" "quit" \
++	| "$BFS" system-back.bfs > bfs_shell-back.log 2>&1 || true
++if [ "$(sha256sum random-back.bin | cut -d' ' -f1)" = "$(cat random-back.sha256)" ]; then
++	ok "the 16 MiB file written at boot 4 reads back identical"
++else
++	bad "luks-random.bin"
++fi
++[ "$(cat marker-back)" = "written at boot 4" ] && ok "marker of boot 4" \
++	|| bad "marker: $(cat marker-back)"
++
++echo "$passed passed, $failed failed"
++[ $failed -eq 0 ]

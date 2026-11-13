@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Fri, 13 Nov 2026 07:56:25 -0500
+Subject: [PATCH 15/15] DriveSetup: lock the window while scanning the disks in
+ Run()
+
+Since "DriveSetup: Register anyboot disk images in RefsReceived()."
+(08afac4cda), MainWindow::Run() starts the window's thread and then
+scans the disks, adding the rows of the partition list. Show() calls
+Run() without the window's lock, so adding a row could drop into the
+debugger with "Looper must be locked." (BView::CopyBits() from
+OutlineView::AddRow()), as it did in the LUKS2 UI test, which has four
+disks.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/apps/drivesetup/MainWindow.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/apps/drivesetup/MainWindow.cpp b/src/apps/drivesetup/MainWindow.cpp
+index 37e538f229..41890f028b 100644
+--- a/src/apps/drivesetup/MainWindow.cpp
++++ b/src/apps/drivesetup/MainWindow.cpp
+@@ -411,8 +411,12 @@ MainWindow::Run()
+ 			strerror(result));
+ 	}
+ 
+-	// visit all disks in the system and show their contents
+-	_ScanDrives();
++	// visit all disks in the system and show their contents (the window's
++	// thread runs already, and Show() calls Run() without the window's lock)
++	if (Lock()) {
++		_ScanDrives();
++		Unlock();
++	}
+ 
+ 	// If DeskBar isn't running, DriveSetup was probably started from Installer.
+ 	// Make sure to show on all workspaces, so the window doesn't disappear when using the

@@ -1,0 +1,812 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: jrash <johnrash@gmail.com>
+Date: Wed, 11 Nov 2026 02:44:41 -0500
+Subject: [PATCH 05/15] luks2: fixes from a review: layout and limit checks,
+ wiping, boot identity
+
+A second agent reviewed the code against the specification and fuzzed it
+under ASan/UBSan (860,000 headers): no memory-safety bug, but:
+- keyslot areas and the data segment weren't checked against each other
+  (addkey could write a keyslot over data, removekey wipe a shared area):
+  the keyslots area is at most 128 MiB, every area inside it and on the
+  device, none overlapping, the data segment behind it;
+- header values sized allocations (a 3 MiB image asked for 128 GiB):
+  4000 AF stripes only, as cryptsetup; Argon2 at most 4 GiB, 64 lanes,
+  2^20 passes; digests must have the hash's length and at most 10 million
+  iterations; at most 16,384 JSON nodes, duplicate member names refused;
+- a secondary header whose size isn't its offset is ignored; when the
+  newer copy's metadata is bad, the other copy is tried;
+- the boot loader frees a locked volume's JSON tree, and wipes keys when
+  it reboots or returns to the firmware;
+- the kernel opens the boot volume by UUID, offset and size, which the
+  loader passes (an older loader's UUID alone still works);
+- a 4 KiB header buffer is no longer on the (kernel) stack; AES
+  temporaries and an AES-NI dead store are wiped.
+
+craft_header.py and 8 hostile-header cases in cryptsetup_test.sh keep the
+review's reproducers: 48 of 48 pass, with and without ASan.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ headers/private/kernel/boot/kernel_args.h |   2 +
+ headers/private/luks2/luks2.h             |  16 +-
+ headers/private/luks2/luks2_json.h        |   3 +
+ src/libs/luks2/arch/x86/aes_ni.cpp        |   2 +-
+ src/libs/luks2/crypto/aes_ct.c            |  13 +-
+ src/libs/luks2/json.cpp                   |  14 +-
+ src/libs/luks2/luks2_read.cpp             | 192 +++++++++++++++-------
+ src/libs/luks2/luks2_write.cpp            |  23 +--
+ src/system/boot/loader/luks.cpp           |   9 +
+ src/system/boot/loader/luks.h             |   3 +-
+ src/system/boot/loader/main.cpp           |   3 +
+ src/system/boot/loader/menu.cpp           |   3 +
+ src/system/kernel/fs/vfs_boot.cpp         |  11 +-
+ src/tests/system/luks2/craft_header.py    |  69 ++++++++
+ src/tests/system/luks2/cryptsetup_test.sh |  26 +++
+ 15 files changed, 309 insertions(+), 80 deletions(-)
+ create mode 100755 src/tests/system/luks2/craft_header.py
+
+diff --git a/headers/private/kernel/boot/kernel_args.h b/headers/private/kernel/boot/kernel_args.h
+index 268715a57f..77459e461f 100644
+--- a/headers/private/kernel/boot/kernel_args.h
++++ b/headers/private/kernel/boot/kernel_args.h
+@@ -41,6 +41,8 @@
+ // UUID and its volume key. The kernel takes the key out of the message (and
+ // wipes it there) before anything else reads the message.
+ #define BOOT_VOLUME_LUKS_UUID			"luks uuid"
++#define BOOT_VOLUME_LUKS_OFFSET			"luks partition offset"
++#define BOOT_VOLUME_LUKS_SIZE			"luks partition size"
+ #define BOOT_VOLUME_LUKS_KEY			"luks volume key"
+ 
+ // boot methods
+diff --git a/headers/private/luks2/luks2.h b/headers/private/luks2/luks2.h
+index eb7226cfe5..25afd7fd24 100644
+--- a/headers/private/luks2/luks2.h
++++ b/headers/private/luks2/luks2.h
+@@ -41,6 +41,16 @@
+ #define LUKS2_DEFAULT_HEADER_SIZE	16384
+ #define LUKS2_DEFAULT_DATA_OFFSET	(16 * 1024 * 1024)
+ #define LUKS2_DEFAULT_STRIPES		4000
++
++// Limits on what headers may ask for. Headers come from any disk; these
++// keep allocations and work bounded, and match what cryptsetup accepts or
++// creates.
++#define LUKS2_MAX_KEYSLOTS_SIZE		(128 * 1024 * 1024)
++#define LUKS2_STRIPES				4000
++#define LUKS2_MAX_ARGON2_MEMORY		(4 * 1024 * 1024)	// KiB
++#define LUKS2_MAX_ARGON2_LANES		64
++#define LUKS2_MAX_ARGON2_TIME		(1 << 20)
++#define LUKS2_MAX_DIGEST_ITERATIONS	10000000
+ #define LUKS2_DEFAULT_DIGEST_ITERATIONS	100000
+ 
+ 
+@@ -167,6 +177,10 @@ bool luks2_has_signature(const void* firstSector, size_t length);
+ int luks2_read_header(const luks2_device_io* io, luks2_volume** _volume);
+ void luks2_free_volume(luks2_volume* volume);
+ 
++/*!	Frees the parsed JSON of a volume that won't be changed: unlocking and
++	checking keys only need the structures. */
++void luks2_release_metadata(luks2_volume* volume);
++
+ /*!	Tries the keyslots that can open segment 0 with \a passphrase: the
+ 	given one, or all with priority 2 then 1 when \a keyslot is -1.
+ 	\a key must hold LUKS2_MAX_KEY_SIZE bytes; the volume key's size is
+@@ -212,7 +226,7 @@ struct luks2_format_parameters {
+ 	uint64_t	data_offset;	// 0: LUKS2_DEFAULT_DATA_OFFSET
+ 	uint64_t	header_size;	// 0: LUKS2_DEFAULT_HEADER_SIZE
+ 	luks2_kdf	kdf;			// the salt is generated
+-	uint32_t	stripes;		// 0: LUKS2_DEFAULT_STRIPES
++	uint32_t	stripes;		// 0 or LUKS2_STRIPES
+ 	uint32_t	digest_iterations;
+ 								// 0: LUKS2_DEFAULT_DIGEST_ITERATIONS
+ };
+diff --git a/headers/private/luks2/luks2_json.h b/headers/private/luks2/luks2_json.h
+index f8affbae16..70fc240e6b 100644
+--- a/headers/private/luks2/luks2_json.h
++++ b/headers/private/luks2/luks2_json.h
+@@ -20,6 +20,9 @@
+ 
+ 
+ #define LUKS2_JSON_MAX_DEPTH	32
++#define LUKS2_JSON_MAX_NODES	16384
++	// cryptsetup's metadata has about a hundred; this keeps a crafted 4 MiB
++	// JSON area from taking hundreds of MB (the boot loader's heap is small)
+ 
+ 
+ enum luks2_json_type {
+diff --git a/src/libs/luks2/arch/x86/aes_ni.cpp b/src/libs/luks2/arch/x86/aes_ni.cpp
+index c41458a151..afbb3f37e6 100644
+--- a/src/libs/luks2/arch/x86/aes_ni.cpp
++++ b/src/libs/luks2/arch/x86/aes_ni.cpp
+@@ -69,7 +69,7 @@ make_decryption_keys(uint8_t* decryption, const uint8_t* encryption,
+ 		memcpy(decryption + i * 16, &key, 16);
+ 	}
+ 	memcpy(decryption + rounds * 16, encryption, 16);
+-	key = (aes_vector){0, 0};
++	luks2_wipe(&key, sizeof(key));
+ }
+ 
+ 
+diff --git a/src/libs/luks2/crypto/aes_ct.c b/src/libs/luks2/crypto/aes_ct.c
+index 1bd8646013..c2828fdfeb 100644
+--- a/src/libs/luks2/crypto/aes_ct.c
++++ b/src/libs/luks2/crypto/aes_ct.c
+@@ -323,7 +323,9 @@ sub_word(uint32_t x)
+ 	aes_ct_ortho(q);
+ 	aes_ct_bitslice_Sbox(q);
+ 	aes_ct_ortho(q);
+-	return q[0];
++	x = q[0];
++	luks2_wipe(q, sizeof(q));
++	return x;
+ }
+ 
+ static const unsigned char Rcon[] = {
+@@ -376,6 +378,7 @@ luks2_aes_keysched_base(uint32_t *skey, const void *key, size_t key_len)
+ 			k ++;
+ 		}
+ 	}
++	luks2_wipe(&tmp, sizeof(tmp));
+ 	return num_rounds;
+ }
+ 
+@@ -681,8 +684,9 @@ void
+ luks2_aes_ct_encrypt(const luks2_aes_ct *ctx, const uint8_t *src,
+ 	uint8_t *dst, size_t num_blocks)
+ {
++	uint32_t q[8];
++
+ 	while (num_blocks > 0) {
+-		uint32_t q[8];
+ 
+ 		q[0] = dec32le(src);
+ 		q[2] = dec32le(src + 4);
+@@ -718,14 +722,16 @@ luks2_aes_ct_encrypt(const luks2_aes_ct *ctx, const uint8_t *src,
+ 			break;
+ 		}
+ 	}
++	luks2_wipe(q, sizeof(q));
+ }
+ 
+ void
+ luks2_aes_ct_decrypt(const luks2_aes_ct *ctx, const uint8_t *src,
+ 	uint8_t *dst, size_t num_blocks)
+ {
++	uint32_t q[8];
++
+ 	while (num_blocks > 0) {
+-		uint32_t q[8];
+ 
+ 		q[0] = dec32le(src);
+ 		q[2] = dec32le(src + 4);
+@@ -761,5 +767,6 @@ luks2_aes_ct_decrypt(const luks2_aes_ct *ctx, const uint8_t *src,
+ 			break;
+ 		}
+ 	}
++	luks2_wipe(q, sizeof(q));
+ }
+ 
+diff --git a/src/libs/luks2/json.cpp b/src/libs/luks2/json.cpp
+index 970645179e..339c667022 100644
+--- a/src/libs/luks2/json.cpp
++++ b/src/libs/luks2/json.cpp
+@@ -20,6 +20,7 @@ struct Parser {
+ 	const char*	text;
+ 	size_t		length;
+ 	size_t		position;
++	size_t		nodes;
+ 
+ 	bool AtEnd() const { return position >= length; }
+ 	char Peek() const { return AtEnd() ? '\0' : text[position]; }
+@@ -294,6 +295,15 @@ parse_members(Parser& parser, luks2_json* node, int depth, bool object)
+ 			key = parse_string(parser);
+ 			if (key == NULL)
+ 				return false;
++			// duplicate names: json-c takes the last, we'd take the first;
++			// neither is safe to guess
++			for (luks2_json* other = node->first; other != NULL;
++					other = other->next) {
++				if (strcmp(other->key, key) == 0) {
++					free(key);
++					return false;
++				}
++			}
+ 			parser.SkipWhitespace();
+ 			if (parser.Peek() != ':') {
+ 				free(key);
+@@ -324,7 +334,7 @@ parse_members(Parser& parser, luks2_json* node, int depth, bool object)
+ luks2_json*
+ parse_value(Parser& parser, int depth)
+ {
+-	if (depth > LUKS2_JSON_MAX_DEPTH)
++	if (depth > LUKS2_JSON_MAX_DEPTH || ++parser.nodes > LUKS2_JSON_MAX_NODES)
+ 		return NULL;
+ 
+ 	parser.SkipWhitespace();
+@@ -477,7 +487,7 @@ write_value(Writer& writer, const luks2_json* node)
+ luks2_json*
+ luks2_json_parse(const char* text, size_t length)
+ {
+-	Parser parser = { text, length, 0 };
++	Parser parser = { text, length, 0, 0 };
+ 	luks2_json* root = parse_value(parser, 0);
+ 	if (root == NULL)
+ 		return NULL;
+diff --git a/src/libs/luks2/luks2_read.cpp b/src/libs/luks2/luks2_read.cpp
+index b56cfe1c2a..942b5481f4 100644
+--- a/src/libs/luks2/luks2_read.cpp
++++ b/src/libs/luks2/luks2_read.cpp
+@@ -71,7 +71,8 @@ copy_header_string(char* target, const uint8_t* source, size_t size)
+ 
+ 
+ /*!	Reads and checks the header copy at \a offset. On success \a copy
+-	owns a buffer with the whole header area. */
++	owns a buffer with the whole header area. (No 4 KiB buffer on the
++	stack: this runs on kernel stacks too.) */
+ void
+ read_header_copy(const luks2_device_io* io, uint64_t offset, bool primary,
+ 	HeaderCopy& copy)
+@@ -79,37 +80,42 @@ read_header_copy(const luks2_device_io* io, uint64_t offset, bool primary,
+ 	copy.valid = false;
+ 	copy.data = NULL;
+ 
+-	uint8_t binary[LUKS2_BINARY_HEADER_SIZE];
+-	if (!read_fully(io, offset, binary, sizeof(binary)))
++	uint8_t* data = (uint8_t*)malloc(LUKS2_BINARY_HEADER_SIZE);
++	if (data == NULL)
+ 		return;
+-
+-	if (memcmp(binary + LUKS2_OFFSET_MAGIC,
++	if (!read_fully(io, offset, data, LUKS2_BINARY_HEADER_SIZE)
++		|| memcmp(data + LUKS2_OFFSET_MAGIC,
+ 			primary ? kLUKS2PrimaryMagic : kLUKS2SecondaryMagic,
+ 			LUKS2_MAGIC_SIZE) != 0
+-		|| binary[LUKS2_OFFSET_VERSION] != 0
+-		|| binary[LUKS2_OFFSET_VERSION + 1] != 2) {
++		|| data[LUKS2_OFFSET_VERSION] != 0
++		|| data[LUKS2_OFFSET_VERSION + 1] != 2) {
++		free(data);
+ 		return;
+ 	}
+ 
+-	uint64_t size = luks2_load64be(binary + LUKS2_OFFSET_HEADER_SIZE);
++	// The secondary copy sits right behind the primary: its offset is the
++	// header size.
++	uint64_t size = luks2_load64be(data + LUKS2_OFFSET_HEADER_SIZE);
+ 	if (!valid_header_size(size)
+-		|| luks2_load64be(binary + LUKS2_OFFSET_HEADER_OFFSET) != offset) {
++		|| luks2_load64be(data + LUKS2_OFFSET_HEADER_OFFSET) != offset
++		|| (!primary && size != offset)) {
++		free(data);
+ 		return;
+ 	}
+ 
+ 	char algorithm[LUKS2_CHECKSUM_ALG_SIZE];
+-	copy_header_string(algorithm, binary + LUKS2_OFFSET_CHECKSUM_ALG,
++	copy_header_string(algorithm, data + LUKS2_OFFSET_CHECKSUM_ALG,
+ 		sizeof(algorithm));
+ 	int hash = luks2_hash_from_name(algorithm);
+-	if (hash == 0)
+-		return;
+-
+-	uint8_t* data = (uint8_t*)malloc(size);
+-	if (data == NULL)
++	uint8_t* whole = hash != 0 ? (uint8_t*)realloc(data, size) : NULL;
++	if (whole == NULL) {
++		free(data);
+ 		return;
+-	memcpy(data, binary, sizeof(binary));
+-	if (!read_fully(io, offset + sizeof(binary), data + sizeof(binary),
+-			size - sizeof(binary))) {
++	}
++	data = whole;
++	if (!read_fully(io, offset + LUKS2_BINARY_HEADER_SIZE,
++			data + LUKS2_BINARY_HEADER_SIZE,
++			size - LUKS2_BINARY_HEADER_SIZE)) {
+ 		free(data);
+ 		return;
+ 	}
+@@ -133,7 +139,7 @@ read_header_copy(const luks2_device_io* io, uint64_t offset, bool primary,
+ 	copy.valid = true;
+ 	copy.offset = offset;
+ 	copy.size = size;
+-	copy.sequenceID = luks2_load64be(binary + LUKS2_OFFSET_SEQUENCE_ID);
++	copy.sequenceID = luks2_load64be(data + LUKS2_OFFSET_SEQUENCE_ID);
+ 	copy.hash = hash;
+ 	copy.data = data;
+ }
+@@ -235,7 +241,10 @@ parse_kdf(const luks2_json* kdfObject, luks2_kdf& kdf, bool& supported)
+ 			|| !get_salt(kdfObject, "salt", kdf.salt, &kdf.salt_length)) {
+ 			return LUKS2_ERROR_CORRUPT;
+ 		}
+-		if (kdf.time == 0 || kdf.cpus == 0 || kdf.memory < 8 * kdf.cpus
++		if (kdf.time == 0 || kdf.time > LUKS2_MAX_ARGON2_TIME
++			|| kdf.cpus == 0 || kdf.cpus > LUKS2_MAX_ARGON2_LANES
++			|| kdf.memory < (uint64_t)8 * kdf.cpus
++			|| kdf.memory > LUKS2_MAX_ARGON2_MEMORY
+ 			|| kdf.salt_length < 8) {
+ 			supported = false;
+ 		}
+@@ -328,8 +337,11 @@ parse_keyslot(luks2_volume* volume, const luks2_json* object,
+ 	if (!get_uint32(af, "stripes", &keyslot.stripes))
+ 		return LUKS2_ERROR_CORRUPT;
+ 	keyslot.af_hash = luks2_hash_from_name(luks2_json_get_string(af, "hash"));
+-	if (keyslot.af_hash == 0 || keyslot.stripes == 0)
++	if (keyslot.af_hash == 0 || keyslot.stripes != LUKS2_STRIPES) {
++		// cryptsetup only ever uses 4000 stripes; others aren't opened
++		// (which also bounds the keyslot material to 256 KB)
+ 		keyslot.supported = false;
++	}
+ 	else if (luks2_round_up((uint64_t)keyslot.stripes * keyslot.key_size,
+ 			LUKS2_KEYSLOT_SECTOR_SIZE) > keyslot.area_size) {
+ 		return LUKS2_ERROR_CORRUPT;
+@@ -371,7 +383,14 @@ parse_digest(const luks2_json* object, luks2_digest& digest)
+ 		return LUKS2_ERROR_CORRUPT;
+ 	digest.digest_length = (size_t)length;
+ 
+-	digest.used = digest.hash != 0 && digest.iterations > 0;
++	// a short digest would let wrong keys through
++	if (digest.hash != 0
++		&& digest.digest_length != luks2_hash_digest_size(digest.hash)) {
++		return LUKS2_ERROR_CORRUPT;
++	}
++
++	digest.used = digest.hash != 0 && digest.iterations > 0
++		&& digest.iterations <= LUKS2_MAX_DIGEST_ITERATIONS;
+ 	return LUKS2_OK;
+ }
+ 
+@@ -460,7 +479,8 @@ luks2_parse_metadata(luks2_volume* volume, uint64_t deviceSize)
+ 		|| !luks2_json_get_uint64(config, "keyslots_size",
+ 			&volume->keyslots_size)
+ 		|| volume->json_size != volume->header_size - LUKS2_BINARY_HEADER_SIZE
+-		|| volume->keyslots_size % 4096 != 0) {
++		|| volume->keyslots_size % 4096 != 0
++		|| volume->keyslots_size > LUKS2_MAX_KEYSLOTS_SIZE) {
+ 		return LUKS2_ERROR_CORRUPT;
+ 	}
+ 	volume->allow_discards = false;
+@@ -498,6 +518,11 @@ luks2_parse_metadata(luks2_volume* volume, uint64_t deviceSize)
+ 	if (volume->segment.offset < 2 * volume->header_size)
+ 		return LUKS2_ERROR_UNSUPPORTED;
+ 			// a detached header
++	if (volume->segment.offset < 2 * volume->header_size
++			+ volume->keyslots_size) {
++		// the data would overlap the keyslots
++		return LUKS2_ERROR_CORRUPT;
++	}
+ 
+ 	// keyslots
+ 	memset(volume->keyslots, 0, sizeof(volume->keyslots));
+@@ -514,6 +539,23 @@ luks2_parse_metadata(luks2_volume* volume, uint64_t deviceSize)
+ 			return result;
+ 	}
+ 
++	// keyslot areas: on the device, and none overlapping another
++	for (int i = 0; i < LUKS2_MAX_KEYSLOTS; i++) {
++		const luks2_keyslot& a = volume->keyslots[i];
++		if (!a.used || a.area_size == 0)
++			continue;
++		if (a.area_offset + a.area_size > deviceSize)
++			return LUKS2_ERROR_CORRUPT;
++		for (int j = i + 1; j < LUKS2_MAX_KEYSLOTS; j++) {
++			const luks2_keyslot& b = volume->keyslots[j];
++			if (b.used && b.area_size != 0
++				&& a.area_offset < b.area_offset + b.area_size
++				&& b.area_offset < a.area_offset + a.area_size) {
++				return LUKS2_ERROR_CORRUPT;
++			}
++		}
++	}
++
+ 	// digests
+ 	memset(volume->digests, 0, sizeof(volume->digests));
+ 	volume->segment_digest = -1;
+@@ -574,6 +616,35 @@ luks2_parse_metadata(luks2_volume* volume, uint64_t deviceSize)
+ }
+ 
+ 
++/*!	Fills \a volume from one header copy and parses its metadata. */
++static int
++volume_from_copy(const luks2_device_io* io, const HeaderCopy& copy,
++	luks2_volume* volume)
++{
++	const uint8_t* data = copy.data;
++	copy_header_string(volume->uuid, data + LUKS2_OFFSET_UUID,
++		LUKS2_UUID_SIZE);
++	copy_header_string(volume->label, data + LUKS2_OFFSET_LABEL,
++		LUKS2_LABEL_SIZE);
++	copy_header_string(volume->subsystem, data + LUKS2_OFFSET_SUBSYSTEM,
++		LUKS2_LABEL_SIZE);
++	volume->header_size = copy.size;
++	volume->sequence_id = copy.sequenceID;
++	volume->header_hash = copy.hash;
++
++	// the JSON text ends at the first NUL of the JSON area
++	const char* json = (const char*)data + LUKS2_BINARY_HEADER_SIZE;
++	size_t jsonAreaSize = copy.size - LUKS2_BINARY_HEADER_SIZE;
++	size_t jsonLength = strnlen(json, jsonAreaSize);
++	if (jsonLength == jsonAreaSize)
++		return LUKS2_ERROR_CORRUPT;
++	volume->json = luks2_json_parse(json, jsonLength);
++	if (volume->json == NULL)
++		return LUKS2_ERROR_CORRUPT;
++	return luks2_parse_metadata(volume, io->size);
++}
++
++
+ extern "C" bool
+ luks2_has_signature(const void* firstSector, size_t length)
+ {
+@@ -613,53 +684,46 @@ luks2_read_header(const luks2_device_io* io, luks2_volume** _volume)
+ 		return LUKS2_ERROR_NOT_LUKS2;
+ 	}
+ 
+-	// the newer valid copy wins; the primary when they're the same
+-	HeaderCopy* chosen = &primary;
++	// The newer valid copy wins (the primary when they're the same); if its
++	// metadata doesn't hold up, the other one is tried.
++	HeaderCopy* first = &primary;
++	HeaderCopy* second = &secondary;
+ 	if (!primary.valid
+ 		|| (secondary.valid && secondary.sequenceID > primary.sequenceID)) {
+-		chosen = &secondary;
+-	}
+-
+-	luks2_volume* volume = (luks2_volume*)calloc(1, sizeof(luks2_volume));
+-	if (volume == NULL) {
+-		free(primary.data);
+-		free(secondary.data);
+-		return LUKS2_ERROR_NO_MEMORY;
++		first = &secondary;
++		second = &primary;
+ 	}
+ 
+-	const uint8_t* data = chosen->data;
+-	copy_header_string(volume->uuid, data + LUKS2_OFFSET_UUID,
+-		LUKS2_UUID_SIZE);
+-	copy_header_string(volume->label, data + LUKS2_OFFSET_LABEL,
+-		LUKS2_LABEL_SIZE);
+-	copy_header_string(volume->subsystem, data + LUKS2_OFFSET_SUBSYSTEM,
+-		LUKS2_LABEL_SIZE);
+-	volume->header_size = chosen->size;
+-	volume->sequence_id = chosen->sequenceID;
+-	volume->header_hash = chosen->hash;
+-	volume->primary_valid = primary.valid;
+-	volume->secondary_valid = secondary.valid;
+-
+-	// the JSON text ends at the first NUL of the JSON area
+-	const char* json = (const char*)data + LUKS2_BINARY_HEADER_SIZE;
+-	size_t jsonAreaSize = chosen->size - LUKS2_BINARY_HEADER_SIZE;
+-	size_t jsonLength = strnlen(json, jsonAreaSize);
+-	int result = LUKS2_OK;
+-	if (jsonLength == jsonAreaSize)
+-		result = LUKS2_ERROR_CORRUPT;
+-	else {
+-		volume->json = luks2_json_parse(json, jsonLength);
+-		result = volume->json != NULL
+-			? luks2_parse_metadata(volume, io->size) : LUKS2_ERROR_CORRUPT;
++	int result = LUKS2_ERROR_CORRUPT;
++	luks2_volume* volume = NULL;
++	HeaderCopy* copies[2] = { first, second };
++	for (int i = 0; i < 2; i++) {
++		if (!copies[i]->valid)
++			continue;
++		luks2_volume* candidate
++			= (luks2_volume*)calloc(1, sizeof(luks2_volume));
++		if (candidate == NULL) {
++			result = LUKS2_ERROR_NO_MEMORY;
++			break;
++		}
++		int candidateResult = volume_from_copy(io, *copies[i], candidate);
++		if (candidateResult == LUKS2_OK) {
++			candidate->primary_valid = primary.valid;
++			candidate->secondary_valid = secondary.valid;
++			volume = candidate;
++			result = LUKS2_OK;
++			break;
++		}
++		luks2_free_volume(candidate);
++		if (i == 0)
++			result = candidateResult;
+ 	}
+ 
+ 	free(primary.data);
+ 	free(secondary.data);
+ 
+-	if (result != LUKS2_OK) {
+-		luks2_free_volume(volume);
++	if (result != LUKS2_OK)
+ 		return result;
+-	}
+ 	*_volume = volume;
+ 	return LUKS2_OK;
+ }
+@@ -833,3 +897,11 @@ luks2_setup_cipher(const luks2_volume* volume, const uint8_t* key,
+ 		return LUKS2_ERROR_UNSUPPORTED;
+ 	return LUKS2_OK;
+ }
++
++
++extern "C" void
++luks2_release_metadata(luks2_volume* volume)
++{
++	luks2_json_free(volume->json);
++	volume->json = NULL;
++}
+diff --git a/src/libs/luks2/luks2_write.cpp b/src/libs/luks2/luks2_write.cpp
+index eceda960e4..fe6c1571f7 100644
+--- a/src/libs/luks2/luks2_write.cpp
++++ b/src/libs/luks2/luks2_write.cpp
+@@ -196,8 +196,11 @@ valid_kdf(const luks2_kdf* kdf)
+ 			return luks2_hash_name(kdf->hash) != NULL && kdf->iterations >= 1000;
+ 		case LUKS2_KDF_ARGON2I:
+ 		case LUKS2_KDF_ARGON2ID:
+-			return kdf->time >= 1 && kdf->cpus >= 1 && kdf->cpus <= 64
+-				&& kdf->memory >= 8 * kdf->cpus;
++			// what the reader accepts
++			return kdf->time >= 1 && kdf->time <= LUKS2_MAX_ARGON2_TIME
++				&& kdf->cpus >= 1 && kdf->cpus <= LUKS2_MAX_ARGON2_LANES
++				&& kdf->memory >= 8 * kdf->cpus
++				&& kdf->memory <= LUKS2_MAX_ARGON2_MEMORY;
+ 	}
+ 	return false;
+ }
+@@ -371,6 +374,9 @@ luks2_format(const luks2_device_io* io,
+ 		? parameters->data_offset : LUKS2_DEFAULT_DATA_OFFSET;
+ 	uint32_t stripes = parameters->stripes != 0
+ 		? parameters->stripes : LUKS2_DEFAULT_STRIPES;
++	if (stripes != LUKS2_STRIPES)
++		return LUKS2_ERROR_BAD_ARGUMENT;
++			// the only value cryptsetup (and the reader here) accepts
+ 
+ 	bool validHeaderSize = false;
+ 	for (size_t i = 0; i < kLUKS2HeaderSizeCount; i++)
+@@ -528,8 +534,10 @@ luks2_add_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ {
+ 	if (io->write == NULL)
+ 		return LUKS2_ERROR_READ_ONLY;
+-	if (!valid_kdf(kdf) || slot >= LUKS2_MAX_KEYSLOTS)
++	if (!valid_kdf(kdf) || slot >= LUKS2_MAX_KEYSLOTS
++		|| (keySize != 32 && keySize != 64)) {
+ 		return LUKS2_ERROR_BAD_ARGUMENT;
++	}
+ 
+ 	// a volume without keyslots has no key size yet: accept the digest's
+ 	luks2_volume checkVolume = *volume;
+@@ -552,14 +560,7 @@ luks2_add_keyslot(luks2_volume* volume, const luks2_device_io* io,
+ 	} else if (volume->keyslots[slot].used)
+ 		return LUKS2_ERROR_BAD_ARGUMENT;
+ 
+-	// the new keyslot uses the stripes of an existing one, or the default
+-	uint32_t stripes = LUKS2_DEFAULT_STRIPES;
+-	for (int i = 0; i < LUKS2_MAX_KEYSLOTS; i++) {
+-		if (volume->keyslots[i].used && volume->keyslots[i].supported) {
+-			stripes = volume->keyslots[i].stripes;
+-			break;
+-		}
+-	}
++	uint32_t stripes = LUKS2_STRIPES;
+ 
+ 	luks2_json* backup = luks2_json_clone(volume->json);
+ 	if (backup == NULL)
+diff --git a/src/system/boot/loader/luks.cpp b/src/system/boot/loader/luks.cpp
+index 92eef3df8d..26da180031 100644
+--- a/src/system/boot/loader/luks.cpp
++++ b/src/system/boot/loader/luks.cpp
+@@ -301,6 +301,10 @@ luks_probe_partition(Partition* partition)
+ 
+ 	luks2_device_io io = volume_io(volume);
+ 	int result = luks2_read_header(&io, &volume->header);
++	if (result == LUKS2_OK) {
++		// unlocking needs only the structures; the loader's heap is small
++		luks2_release_metadata(volume->header);
++	}
+ 	if (result != LUKS2_OK) {
+ 		dprintf("luks: partition at %" B_PRIdOFF ": %s\n", partition->offset,
+ 			luks2_error_string(result));
+@@ -610,8 +614,13 @@ luks_add_boot_volume_key()
+ 	if (sBootVolume == NULL)
+ 		return;
+ 
++	// the partition is identified by its UUID, offset and size on its disk
+ 	EncryptedDisk* disk = sBootVolume->disk;
+ 	if (gBootParams.AddString(BOOT_VOLUME_LUKS_UUID, disk->UUID()) != B_OK
++		|| gBootParams.AddInt64(BOOT_VOLUME_LUKS_OFFSET, sBootVolume->offset)
++			!= B_OK
++		|| gBootParams.AddInt64(BOOT_VOLUME_LUKS_SIZE, sBootVolume->size)
++			!= B_OK
+ 		|| gBootParams.AddData(BOOT_VOLUME_LUKS_KEY, B_RAW_TYPE, disk->Key(),
+ 			disk->KeySize()) != B_OK) {
+ 		dprintf("luks: no room for the volume key in the boot volume "
+diff --git a/src/system/boot/loader/luks.h b/src/system/boot/loader/luks.h
+index 5d2b31cc6e..0885a9a867 100644
+--- a/src/system/boot/loader/luks.h
++++ b/src/system/boot/loader/luks.h
+@@ -50,7 +50,8 @@ void luks_add_boot_volume_key();
+ 
+ /*!	Wipes the volume keys, the ciphers' key schedules and the key in the
+ 	loader's boot volume message. Called after the message was copied to
+-	the kernel args; nothing can be read from encrypted volumes after it. */
++	the kernel args, and before the loader reboots or returns to the
++	firmware; nothing can be read from encrypted volumes after it. */
+ void luks_cleanup();
+ 
+ 
+diff --git a/src/system/boot/loader/main.cpp b/src/system/boot/loader/main.cpp
+index 9f587f1912..f84ed2f7ab 100644
+--- a/src/system/boot/loader/main.cpp
++++ b/src/system/boot/loader/main.cpp
+@@ -192,6 +192,9 @@ main(stage2_args *args)
+ 	}
+ 
+ out:
++#ifdef BOOT_SUPPORT_LUKS
++	luks_cleanup();
++#endif
+ 	heap_release();
+ 	return 0;
+ }
+diff --git a/src/system/boot/loader/menu.cpp b/src/system/boot/loader/menu.cpp
+index c594c8b9e6..08d03fc3fe 100644
+--- a/src/system/boot/loader/menu.cpp
++++ b/src/system/boot/loader/menu.cpp
+@@ -1633,6 +1633,9 @@ apply_safe_mode_path_blocklist()
+ static bool
+ user_menu_reboot(Menu* menu, MenuItem* item)
+ {
++#ifdef BOOT_SUPPORT_LUKS
++	luks_cleanup();
++#endif
+ 	platform_exit();
+ 	return true;
+ }
+diff --git a/src/system/kernel/fs/vfs_boot.cpp b/src/system/kernel/fs/vfs_boot.cpp
+index 36dec3196e..337f58ca3a 100644
+--- a/src/system/kernel/fs/vfs_boot.cpp
++++ b/src/system/kernel/fs/vfs_boot.cpp
+@@ -67,6 +67,8 @@ bool gReadOnlyBootDevice = false;
+ // wiped as soon as the boot volume is mounted.
+ struct BootVolumeKey {
+ 	char	uuid[40];
++	off_t	offset;		// of the partition on its disk, -1 if not given
++	off_t	size;
+ 	uint8	key[64];
+ 	size_t	keySize;
+ 	bool	opened;
+@@ -365,6 +367,9 @@ take_boot_volume_keys(KMessage& bootVolume)
+ 			&& keySize > 0 && keySize <= (int32)sizeof(BootVolumeKey::key)) {
+ 			BootVolumeKey& entry = sBootVolumeKeys[sBootVolumeKeyCount++];
+ 			strlcpy(entry.uuid, uuid, sizeof(entry.uuid));
++			// older loaders don't pass the partition's place
++			entry.offset = bootVolume.GetInt64(BOOT_VOLUME_LUKS_OFFSET, i, -1);
++			entry.size = bootVolume.GetInt64(BOOT_VOLUME_LUKS_SIZE, i, -1);
+ 			memcpy(entry.key, key, keySize);
+ 			entry.keySize = keySize;
+ 			entry.opened = false;
+@@ -430,8 +435,12 @@ open_encrypted_boot_volumes(KDiskDeviceManager* manager)
+ 
+ 			for (int32 i = 0; i < sBootVolumeKeyCount; i++) {
+ 				BootVolumeKey& entry = sBootVolumeKeys[i];
+-				if (entry.opened || strcmp(entry.uuid, uuid) != 0)
++				if (entry.opened || strcmp(entry.uuid, uuid) != 0
++					|| (entry.offset >= 0
++						&& (partition->Offset() != entry.offset
++							|| partition->Size() != entry.size))) {
+ 					continue;
++				}
+ 
+ 				KPath path;
+ 				if (partition->GetPath(&path) != B_OK)
+diff --git a/src/tests/system/luks2/craft_header.py b/src/tests/system/luks2/craft_header.py
+new file mode 100755
+index 0000000000..00aa60f056
+--- /dev/null
++++ b/src/tests/system/luks2/craft_header.py
+@@ -0,0 +1,69 @@
++#!/usr/bin/env python3
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Makes a damaged or hostile LUKS2 header for the negative tests: rewrites
++# the JSON metadata of an image (both header copies) and fixes the
++# checksums, so only the metadata is wrong.
++# Usage: craft_header.py <in image> <out image> <case>
++
++import hashlib
++import json
++import struct
++import sys
++
++source, target, case = sys.argv[1:4]
++image = bytearray(open(source, "rb").read())
++header_size = struct.unpack(">Q", image[8:16])[0]
++text = image[4096:header_size].split(b"\0", 1)[0].decode()
++j = json.loads(text)
++raw = None
++secondary_size = header_size
++slot = j["keyslots"]["0"]
++area = slot["area"]
++
++if case == "area-overlaps-data":
++    # keyslots area reaching into the data segment
++    j["config"]["keyslots_size"] = str(int(j["segments"]["0"]["offset"]))
++elif case == "areas-overlap":
++    other = json.loads(json.dumps(slot))
++    other["area"]["offset"] = str(int(area["offset"]) + 4096)
++    j["keyslots"]["1"] = other
++    j["digests"]["0"]["keyslots"].append("1")
++elif case == "huge-keyslots-size":
++    j["config"]["keyslots_size"] = str(1 << 40)
++elif case == "short-digest":
++    j["digests"]["0"]["digest"] = "AA=="
++elif case == "duplicate-key":
++    segment = j["segments"]["0"]
++    raw = json.dumps(j, separators=(",", ":"))
++    raw = raw.replace('"offset":"%s"' % segment["offset"],
++        '"offset":"%s","offset":"%d"' % (segment["offset"],
++            int(segment["offset"]) * 2), 1)
++elif case == "secondary-size":
++    secondary_size = header_size * 2
++elif case == "argon2-lanes":
++    slot["kdf"] = {"type": "argon2id", "time": 4, "memory": 1 << 30,
++        "cpus": (1 << 24) - 1, "salt": slot["kdf"]["salt"]}
++elif case == "stripes":
++    slot["af"]["stripes"] = 4000000000
++else:
++    sys.exit("unknown case " + case)
++
++data = (raw if raw is not None else json.dumps(j, separators=(",", ":"))) \
++    .encode()
++assert len(data) < header_size - 4096
++
++
++def write_copy(offset, size_field):
++    copy = image[offset:offset + header_size]
++    copy[8:16] = struct.pack(">Q", size_field)
++    copy[4096:header_size] = data + b"\0" * (header_size - 4096 - len(data))
++    copy[448:512] = b"\0" * 64
++    copy[448:480] = hashlib.sha256(bytes(copy)).digest()
++    image[offset:offset + header_size] = copy
++
++
++write_copy(0, header_size)
++write_copy(header_size, secondary_size)
++open(target, "wb").write(image)
+diff --git a/src/tests/system/luks2/cryptsetup_test.sh b/src/tests/system/luks2/cryptsetup_test.sh
+index 5d0abc2dfe..4950add530 100755
+--- a/src/tests/system/luks2/cryptsetup_test.sh
++++ b/src/tests/system/luks2/cryptsetup_test.sh
+@@ -180,6 +180,32 @@ cs luksFormat --type luks1 --key-file k0 --pbkdf-force-iterations 1000 \
+ 	cs-luks1.img
+ expect_refused "LUKS1 volume" cs-luks1.img k0 "not a LUKS2"
+ 
++echo "== hostile headers (checksums right, metadata wrong)"
++
++image cs-base.img 40M
++cs luksFormat --type luks2 --key-file k0 --pbkdf pbkdf2 \
++	--pbkdf-force-iterations 1000 cs-base.img
++for case in area-overlaps-data areas-overlap huge-keyslots-size short-digest \
++		duplicate-key; do
++	python3 -I "$HERE/craft_header.py" cs-base.img hostile.img $case
++	expect_refused "$case" hostile.img k0 "damaged"
++done
++python3 -I "$HERE/craft_header.py" cs-base.img hostile.img secondary-size
++if "$LUKS" dump hostile.img | grep -q "primary ok, SECONDARY DAMAGED"; then
++	ok "a secondary header whose size isn't its offset is ignored"
++else
++	bad "secondary-size"
++fi
++for case in argon2-lanes stripes; do
++	python3 -I "$HERE/craft_header.py" cs-base.img hostile.img $case
++	out=$(timeout 20 "$LUKS" test -k k0 hostile.img 2>&1)
++	if [ $? -eq 2 ] && "$LUKS" dump hostile.img | grep -q "not supported"; then
++		ok "$case: keyslot not supported, nothing allocated"
++	else
++		bad "$case: $out"
++	fi
++done
++
+ echo "== data encrypted by cryptsetup, decrypted by luks"
+ 
+ # offline encryption keeps <size - reduce> bytes of plaintext
