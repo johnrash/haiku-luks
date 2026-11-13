@@ -1,0 +1,635 @@
+From 87e5d6b002e8de9276806a2286fa1b52054c1d8c Mon Sep 17 00:00:00 2001
+From: Codex <noreply@openai.com>
+Date: Fri, 13 Nov 2026 13:44:03 -0500
+Subject: [PATCH] luks: prevent user-buffer deadlocks and protect destructive
+ commands
+
+Wire user buffers before taking the volume lock or a bounce buffer. Page
+faults can reenter the same encrypted volume: sixteen concurrent reads
+into cold private file mappings exhausted the original four-buffer pool
+and completed zero reads. The fixed driver completes all sixteen.
+
+Flush regular-file backing with fsync rather than accepting an unsupported
+device ioctl. Count only supported, bound, non-ignored keyslots when
+protecting the last automatically usable slot. Compare copy endpoints
+before truncating an output, including hard-link and symlink aliases.
+
+Add eight host safety checks and a native QEMU memory regression. The
+optimized interoperability/crash suite passes 69 checks; the safety cases
+pass optimized and ASan/UBSan builds (leak detection disabled because of
+the traced environment). The native driver, CLI and helper cross-compile
+and link, and the QEMU regression completes 16/16 reads with no errors.
+
+AI-written with OpenAI Codex for the repository owner.
+---
+ .../disk/virtual/luks_disk/luks_disk.cpp      |  58 +++++++++-
+ src/bin/luks/luks.cpp                         |  33 +++++-
+ src/tests/system/Jamfile                      |   1 +
+ src/tests/system/luks2/Jamfile                |   3 +
+ src/tests/system/luks2/README.md              |  24 ++++
+ src/tests/system/luks2/driver_memory_test.c   |  90 +++++++++++++++
+ .../system/luks2/qemu/guest-memory-test.sh    |  32 ++++++
+ .../system/luks2/qemu/run-memory-test.py      | 105 ++++++++++++++++++
+ src/tests/system/luks2/run_tests.sh           |   1 +
+ src/tests/system/luks2/safety_test.sh         |  73 ++++++++++++
+ 10 files changed, 413 insertions(+), 7 deletions(-)
+ create mode 100644 src/tests/system/luks2/Jamfile
+ create mode 100644 src/tests/system/luks2/driver_memory_test.c
+ create mode 100644 src/tests/system/luks2/qemu/guest-memory-test.sh
+ create mode 100644 src/tests/system/luks2/qemu/run-memory-test.py
+ create mode 100644 src/tests/system/luks2/safety_test.sh
+
+diff --git a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+index fdfb75b..e823e1d 100644
+--- a/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
++++ b/src/add-ons/kernel/drivers/disk/virtual/luks_disk/luks_disk.cpp
+@@ -133,6 +133,7 @@ private:
+ 			uint64				fIVTweak;
+ 			uint32				fKeyBits;
+ 			bool				fReadOnly;
++			bool				fFileBacked;
+ 			bool				fClosing;
+ 			int32				fOpenCount;
+ 			device_node*		fNode;
+@@ -166,12 +167,15 @@ header_read(void* cookie, uint64_t offset, void* buffer, size_t size)
+ 
+ 
+ static status_t
+-get_device_size(int fd, uint64* _size, bool* _readOnly)
++get_device_size(int fd, uint64* _size, bool* _readOnly,
++	bool* _fileBacked = NULL)
+ {
+ 	struct stat st;
+ 	if (fstat(fd, &st) != 0)
+ 		return errno;
+ 	*_readOnly = false;
++	if (_fileBacked != NULL)
++		*_fileBacked = S_ISREG(st.st_mode);
+ 	if (S_ISREG(st.st_mode)) {
+ 		*_size = st.st_size;
+ 		return B_OK;
+@@ -225,6 +229,7 @@ Volume::Volume(int32 id)
+ 	fIVTweak(0),
+ 	fKeyBits(0),
+ 	fReadOnly(false),
++	fFileBacked(false),
+ 	fClosing(false),
+ 	fOpenCount(0),
+ 	fNode(NULL),
+@@ -276,7 +281,8 @@ Volume::Init(const char* path, const uint8* key, size_t keySize,
+ 
+ 	uint64 deviceSize;
+ 	bool readOnlyDevice;
+-	status_t status = get_device_size(fFD, &deviceSize, &readOnlyDevice);
++	status_t status = get_device_size(fFD, &deviceSize, &readOnlyDevice,
++		&fFileBacked);
+ 	if (status != B_OK)
+ 		return status;
+ 	if (readOnlyDevice && !fReadOnly) {
+@@ -413,6 +419,38 @@ copy_from(void* target, const void* source, size_t length)
+ }
+ 
+ 
++/*!	Fault in and wire user buffers before taking the volume lock or a
++	bounce buffer. A fault can read this same volume (including its swap
++	file), and must not wait on resources held by the faulting operation.
++	Kernel I/O buffers are already resident; the page writer needs no new
++	allocation here. */
++class UserBufferLocker {
++public:
++	UserBufferLocker(void* buffer, size_t length, uint32 flags)
++		:
++		fBuffer(IS_USER_ADDRESS(buffer) ? buffer : NULL),
++		fLength(length),
++		fFlags(flags),
++		fStatus(fBuffer != NULL ? lock_memory(fBuffer, fLength, fFlags) : B_OK)
++	{
++	}
++
++	~UserBufferLocker()
++	{
++		if (fBuffer != NULL && fStatus == B_OK)
++			unlock_memory(fBuffer, fLength, fFlags);
++	}
++
++	status_t Status() const { return fStatus; }
++
++private:
++	void*		fBuffer;
++	size_t		fLength;
++	uint32		fFlags;
++	status_t	fStatus;
++};
++
++
+ status_t
+ Volume::Read(off_t position, void* buffer, size_t* _length)
+ {
+@@ -425,6 +463,10 @@ Volume::Read(off_t position, void* buffer, size_t* _length)
+ 	if (length == 0)
+ 		return B_OK;
+ 
++	UserBufferLocker userBuffer(buffer, length, B_READ_DEVICE);
++	if (userBuffer.Status() != B_OK)
++		return userBuffer.Status();
++
+ 	ReadLocker locker(fLock);
+ 	BounceBuffer* bounce = _AcquireBuffer();
+ 	status_t status = B_OK;
+@@ -473,6 +515,10 @@ Volume::Write(off_t position, const void* buffer, size_t* _length)
+ 	if (length == 0)
+ 		return B_OK;
+ 
++	UserBufferLocker userBuffer(const_cast<void*>(buffer), length, 0);
++	if (userBuffer.Status() != B_OK)
++		return userBuffer.Status();
++
+ 	// Partial sectors need a read-modify-write that no other write may
+ 	// interleave with.
+ 	bool partial = position % fSectorSize != 0
+@@ -540,6 +586,14 @@ Volume::Write(off_t position, const void* buffer, size_t* _length)
+ status_t
+ Volume::Flush()
+ {
++	if (fFileBacked) {
++		while (fsync(fFD) != 0) {
++			if (errno != EINTR)
++				return errno;
++		}
++		return B_OK;
++	}
++
+ 	if (ioctl(fFD, B_FLUSH_DRIVE_CACHE, NULL, 0) != 0) {
+ 		// a device without a cache to flush is fine
+ 		if (errno != B_DEV_INVALID_IOCTL && errno != B_BAD_VALUE
+diff --git a/src/bin/luks/luks.cpp b/src/bin/luks/luks.cpp
+index 6436453..766804f 100644
+--- a/src/bin/luks/luks.cpp
++++ b/src/bin/luks/luks.cpp
+@@ -613,21 +613,23 @@ command_remove_key(const char* path, int slotToRemove)
+ 	if (slotToRemove < 0)
+ 		slotToRemove = openedSlot;
+ 
+-	// what's left to open the data with: keyslots bound to its digest (an
+-	// unbound keyslot holds some other key)
++	// Keep a slot Haiku can actually try at boot or in the GUI. An unbound
++	// slot holds another key; unsupported and ignored slots aren't tried.
+ 	const luks2_keyslot* keyslots = volume->keyslots;
+ 	bool removingBound = keyslots[slotToRemove].used
+ 		&& keyslots[slotToRemove].digest == volume->segment_digest;
+ 	int remaining = 0;
+ 	for (int i = 0; i < LUKS2_MAX_KEYSLOTS; i++) {
+ 		if (keyslots[i].used && keyslots[i].digest == volume->segment_digest
++			&& keyslots[i].supported && keyslots[i].priority != 0
+ 			&& i != slotToRemove) {
+ 			remaining++;
+ 		}
+ 	}
+ 	if (removingBound && remaining == 0 && !sOptions.force) {
+-		fprintf(stderr, "%s: keyslot %d is the last one; without it the "
+-			"volume can't be opened any more. Use --force to remove it "
++		fprintf(stderr, "%s: keyslot %d is the last one Haiku can try "
++			"automatically; removing it can prevent unlocking or booting "
++			"this volume. Use --force to remove it "
+ 			"anyway.\n", kProgramName, slotToRemove);
+ 		luks2_free_volume(volume);
+ 		return 1;
+@@ -669,7 +671,7 @@ command_copy(const char* path, const char* file, bool write)
+ 	}
+ 
+ 	int fileFD = write ? open(file, O_RDONLY)
+-		: open(file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++		: open(file, O_WRONLY | O_CREAT, 0644);
+ 	if (fileFD < 0) {
+ 		fprintf(stderr, "%s: can't open %s: %s\n", kProgramName, file,
+ 			strerror(errno));
+@@ -678,6 +680,27 @@ command_copy(const char* path, const char* file, bool write)
+ 		return 1;
+ 	}
+ 
++	// Check the opened files, including hard-link and symlink aliases,
++	// before truncating an output file or writing any data.
++	struct stat deviceStat;
++	struct stat fileStat;
++	const char* fileError = NULL;
++	if (fstat(device.fd, &deviceStat) != 0 || fstat(fileFD, &fileStat) != 0)
++		fileError = strerror(errno);
++	else if (deviceStat.st_dev == fileStat.st_dev
++		&& deviceStat.st_ino == fileStat.st_ino) {
++		fileError = "the input and output refer to the same file or device";
++	} else if (!write && S_ISREG(fileStat.st_mode) && ftruncate(fileFD, 0) != 0)
++		fileError = strerror(errno);
++	if (fileError != NULL) {
++		fprintf(stderr, "%s: %s: %s\n", kProgramName, file, fileError);
++		luks2_xts_clear(&xts);
++		luks2_free_volume(volume);
++		close(fileFD);
++		close(device.fd);
++		return 1;
++	}
++
+ 	uint64_t total = volume->segment.size;
+ 	if (write) {
+ 		// all of the file or nothing: check it fits before writing
+diff --git a/src/tests/system/Jamfile b/src/tests/system/Jamfile
+index 6b57db7..f2760ff 100644
+--- a/src/tests/system/Jamfile
++++ b/src/tests/system/Jamfile
+@@ -5,6 +5,7 @@ SubInclude HAIKU_TOP src tests system boot ;
+ SubInclude HAIKU_TOP src tests system glue ;
+ if $(TARGET_CC_IS_LEGACY_GCC_$(TARGET_PACKAGING_ARCH)) = 0 {
+ 	SubInclude HAIKU_TOP src tests system kernel ;
++	SubInclude HAIKU_TOP src tests system luks2 ;
+ }
+ SubInclude HAIKU_TOP src tests system libroot ;
+ SubInclude HAIKU_TOP src tests system network ;
+diff --git a/src/tests/system/luks2/Jamfile b/src/tests/system/luks2/Jamfile
+new file mode 100644
+index 0000000..9751428
+--- /dev/null
++++ b/src/tests/system/luks2/Jamfile
+@@ -0,0 +1,3 @@
++SubDir HAIKU_TOP src tests system luks2 ;
++
++SimpleTest luks2_driver_memory_test : driver_memory_test.c ;
+diff --git a/src/tests/system/luks2/README.md b/src/tests/system/luks2/README.md
+index f5f806d..a4fb68f 100644
+--- a/src/tests/system/luks2/README.md
++++ b/src/tests/system/luks2/README.md
+@@ -15,6 +15,9 @@ UndefinedBehaviorSanitizer) and runs:
+   RFC 9106 (Argon2d/i/id);
+ - `crypto_crosscheck.py`: random XTS, PBKDF2 and Argon2 inputs against
+   OpenSSL (Python's `cryptography`, `hashlib`, `openssl kdf`);
++- `safety_test.sh`: removing the last usable keyslot when only unsupported
++  or ignored slots remain; refusing a read onto the encrypted source itself
++  (including hard links and symlinks), without changing the source;
+ - `cryptsetup_test.sh`: interoperability tests with Linux's cryptsetup in
+   both directions (both KDFs and their parameters, several keyslots,
+   priorities, killed slots, damaged headers, LUKS1 and interrupted
+@@ -44,6 +47,27 @@ Both need an anyboot image built with these changes, OVMF (`/usr/share/OVMF`), t
+ host `luks`, `bfs_shell` from the build directory and cryptsetup. QEMU runs in
+ software emulation (`-cpu max` emulates AES-NI).
+ 
++The driver memory regression needs only the anyboot image, `bfs_shell`,
++OVMF, Python 3, QEMU and the Haiku test binary. Build the latter with
++`jam luks2_driver_memory_test` in the Haiku build directory, then run:
++
++```sh
++python3 src/tests/system/luks2/qemu/run-memory-test.py \
++    /absolute/path/haiku-release-anyboot.iso /tmp/luks-memory-new \
++    /absolute/path/bfs_shell \
++    /absolute/path/objects/haiku/x86_64/release/tests/system/luks2/luks2_driver_memory_test
++```
++
++The work directory must not exist. The test creates its own disk, formats
++LUKS2 and BFS, writes a source file, and unmounts/remounts to discard cached
++pages. Sixteen threads then read the decrypted device into separate private
++mappings of that file. Faulting while holding one of the driver's four
++bounce buffers deadlocked the old driver; all sixteen reads must finish
++with the fixed driver. `serial.log` records the result; the runner stops
++the VM on success, failure or timeout (180 seconds by default). The emulated
++network is restricted and keeps stock Haiku's network-unload deadlock out
++of this test.
++
+ The tests that type into the guest's serial console (the boot, loader and UI
+ tests) have QEMU write the console's output to a file and read the
+ keystrokes from a FIFO (`-chardev file,...,input-path=`). Don't put it on a
+diff --git a/src/tests/system/luks2/driver_memory_test.c b/src/tests/system/luks2/driver_memory_test.c
+new file mode 100644
+index 0000000..fde5d3a
+--- /dev/null
++++ b/src/tests/system/luks2/driver_memory_test.c
+@@ -0,0 +1,90 @@
++/*
++ * Copyright 2026, haiku-odroid-c2 port authors.
++ * Distributed under the terms of the MIT License.
++ *
++ * Read into cold private mappings of a file on the SAME encrypted volume.
++ * With more workers than bounce buffers, faulting while holding a buffer
++ * can exhaust the pool and deadlock. Neither input is modified.
++ */
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include <OS.h>
++
++#define WORKERS 16
++#define LENGTH 65536
++
++static sem_id sStart;
++static int sRaw;
++static int32 sFinished;
++static int32 sErrors;
++
++
++static void*
++read_worker(void* data)
++{
++	if (acquire_sem(sStart) != B_OK
++		|| pread(sRaw, data, LENGTH, 1048576) != LENGTH) {
++		atomic_add(&sErrors, 1);
++	}
++	atomic_add(&sFinished, 1);
++	return NULL;
++}
++
++
++int
++main(int argc, char** argv)
++{
++	if (argc != 3) {
++		fprintf(stderr, "usage: %s <cold file on volume> <unlocked device>\n",
++			argv[0]);
++		return 1;
++	}
++	int file = open(argv[1], O_RDONLY);
++	sRaw = open(argv[2], O_RDONLY);
++	struct stat st;
++	if (file < 0 || sRaw < 0 || fstat(file, &st) != 0
++		|| st.st_size < WORKERS * LENGTH) {
++		fprintf(stderr, "can't open inputs or source file is too small\n");
++		return 1;
++	}
++	sStart = create_sem(0, "luks2 memory test start");
++	if (sStart < B_OK)
++		return 1;
++	pthread_t threads[WORKERS];
++	void* mappings[WORKERS];
++	for (int i = 0; i < WORKERS; i++) {
++		mappings[i] = mmap(NULL, LENGTH, PROT_READ | PROT_WRITE, MAP_PRIVATE,
++			file, (off_t)i * LENGTH);
++		if (mappings[i] == MAP_FAILED
++			|| pthread_create(&threads[i], NULL, read_worker, mappings[i]) != 0) {
++			fprintf(stderr, "can't create mapping or worker %d\n", i);
++			return 1;
++		}
++	}
++	puts("LUKSMEM releasing concurrent reads into file mappings");
++	fflush(stdout);
++	if (release_sem_etc(sStart, WORKERS, 0) != B_OK)
++		return 1;
++	for (int i = 0; i < 200 && atomic_get(&sFinished) != WORKERS; i++)
++		snooze(100000);
++	printf("LUKSMEM finished %ld of %d, errors %ld\n",
++		(long)atomic_get(&sFinished), WORKERS, (long)atomic_get(&sErrors));
++	fflush(stdout);
++	// Exiting a process with blocked kernel I/O may itself hang. The QEMU
++	// runner also has a timeout and retains the serial log in that case.
++	if (atomic_get(&sFinished) != WORKERS)
++		return 2;
++	for (int i = 0; i < WORKERS; i++) {
++		pthread_join(threads[i], NULL);
++		munmap(mappings[i], LENGTH);
++	}
++	delete_sem(sStart);
++	close(sRaw);
++	close(file);
++	return atomic_get(&sErrors) == 0 ? 0 : 1;
++}
+diff --git a/src/tests/system/luks2/qemu/guest-memory-test.sh b/src/tests/system/luks2/qemu/guest-memory-test.sh
+new file mode 100644
+index 0000000..e01886c
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/guest-memory-test.sh
+@@ -0,0 +1,32 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++# Only the isolated disk carrying our marker is formatted.
++set -eu
++T=/boot/system/settings/luks-memory-test
++exec > /dev/dprintf 2>&1
++trap 'echo "LUKSMEM FAIL"' EXIT
++sleep 10
++target=
++for raw in /dev/disk/nvme/*/raw; do
++	if [ "$(head -c 13 "$raw")" = LUKSMEM-BLANK ]; then
++		target=$raw
++	fi
++done
++[ -n "$target" ]
++luks format -y -k "$T/key" --pbkdf pbkdf2 --iterations 1000 "$target"
++dev=$(luks open -k "$T/key" "$target")
++mkfs -t bfs -q "$dev" LuksMemoryTest
++mkdir -p /LuksMemoryTest
++mount -t bfs "$dev" /LuksMemoryTest
++dd if=/dev/zero of=/LuksMemoryTest/payload bs=1048576 count=4
++sync
++# Dropping the filesystem and its cache is essential to cause page faults.
++unmount /LuksMemoryTest
++mount -t bfs "$dev" /LuksMemoryTest
++"$T/driver_memory_test" /LuksMemoryTest/payload "$dev"
++unmount /LuksMemoryTest
++luks close "$dev"
++trap - EXIT
++echo "LUKSMEM PASS"
++shutdown
+diff --git a/src/tests/system/luks2/qemu/run-memory-test.py b/src/tests/system/luks2/qemu/run-memory-test.py
+new file mode 100644
+index 0000000..fd7e803
+--- /dev/null
++++ b/src/tests/system/luks2/qemu/run-memory-test.py
+@@ -0,0 +1,105 @@
++#!/usr/bin/env python3
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++"""Run the driver page-fault regression in an isolated, disposable VM."""
++
++import argparse
++from pathlib import Path
++import shutil
++import struct
++import subprocess
++import time
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("image", type=Path)
++    parser.add_argument("work", type=Path, help="a new work directory")
++    parser.add_argument("bfs_shell", type=Path)
++    parser.add_argument("helper", type=Path, help="Haiku luks2_driver_memory_test")
++    parser.add_argument("--timeout", type=int, default=180)
++    args = parser.parse_args()
++    image = args.image.resolve(strict=True)
++    bfs = args.bfs_shell.resolve(strict=True)
++    helper = args.helper.resolve(strict=True)
++    work = args.work.resolve()
++    # Refuse reuse: never truncate an existing user's disk image.
++    work.mkdir(parents=True, exist_ok=False)
++    here = Path(__file__).resolve().parent
++    shutil.copyfile(image, work / "boot.img")
++    with (work / "data.img").open("xb") as disk:
++        disk.truncate(128 * 1024 * 1024)
++        disk.write(b"LUKSMEM-BLANK\n")
++    (work / "key").write_text("disposable memory test passphrase")
++    (work / "test.job").write_text(
++        "job x-vnd.luks-memory-test {\n"
++        " launch /bin/sh /boot/system/settings/luks-memory-test/test.sh\n}\n")
++    with image.open("rb") as source:
++        mbr = source.read(512)
++    entries = [mbr[446 + 16 * i:462 + 16 * i] for i in range(4)]
++    offsets = [struct.unpack_from("<I", e, 8)[0] * 512
++               for e in entries if e[4] == 0xeb]
++    if mbr[510:] != b"\x55\xaa" or not offsets:
++        raise RuntimeError("image has no BFS MBR partition")
++    guest = "/myfs/system/settings/luks-memory-test"
++    commands = [f"mkdir -p {guest}", "mkdir -p /myfs/system/settings/launch"]
++    for source, destination in [
++        (here / "guest-memory-test.sh", guest + "/test.sh"),
++        (helper, guest + "/driver_memory_test"),
++        (work / "key", guest + "/key"),
++        (work / "test.job", "/myfs/system/settings/launch/luks-memory-test"),
++    ]:
++        # bfs_shell's command language accepts quoted paths.
++        if any(c in str(source) for c in '\n\r"\\'):
++            raise ValueError("unsupported character in fixture path")
++        commands.append(f'cp ":{source}" "{destination}"')
++    commands += ["sync", "quit"]
++    prepared = subprocess.run(
++        [str(bfs), "--start-offset", str(offsets[0]), str(work / "boot.img")],
++        input="\n".join(commands) + "\n", text=True,
++        stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
++    (work / "bfs_shell.log").write_text(prepared.stdout)
++    if prepared.returncode or "Error" in prepared.stdout:
++        raise RuntimeError(f"fixture preparation failed; see {work}/bfs_shell.log")
++    shutil.copyfile("/usr/share/OVMF/OVMF_VARS_4M.fd", work / "vars.fd")
++    command = [
++        "qemu-system-x86_64", "-M", "q35", "-cpu", "max", "-smp", "4",
++        "-m", "2048", "-accel", "tcg,thread=multi",
++        "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
++        "-drive", "if=pflash,format=raw,file=vars.fd",
++        "-drive", "if=none,id=boot,format=raw,file=boot.img",
++        "-device", "nvme,drive=boot,serial=boot",
++        "-drive", "if=none,id=data,format=raw,file=data.img",
++        "-device", "nvme,drive=data,serial=memory-test",
++        # Avoid the stock module-unload deadlock triggered with no NIC.
++        "-netdev", "user,id=net0,restrict=on", "-device", "e1000,netdev=net0",
++        "-display", "none", "-serial", "file:serial.log", "-no-reboot",
++    ]
++    passed = False
++    with (work / "qemu.log").open("w") as log:
++        vm = subprocess.Popen(command, cwd=work, stdout=log, stderr=log)
++        try:
++            deadline = time.monotonic() + args.timeout
++            while time.monotonic() < deadline:
++                serial = work / "serial.log"
++                output = serial.read_text(errors="replace") if serial.exists() else ""
++                if "LUKSMEM PASS" in output:
++                    passed = True
++                    break
++                if "LUKSMEM FAIL" in output or vm.poll() is not None:
++                    break
++                time.sleep(1)
++        finally:
++            if vm.poll() is None:
++                vm.terminate()
++                try:
++                    vm.wait(timeout=10)
++                except subprocess.TimeoutExpired:
++                    vm.kill()
++                    vm.wait()
++    print(f"{'ok' if passed else 'FAIL'} driver memory test; logs: {work}")
++    return 0 if passed else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/src/tests/system/luks2/run_tests.sh b/src/tests/system/luks2/run_tests.sh
+index 72bf816..81869b1 100755
+--- a/src/tests/system/luks2/run_tests.sh
++++ b/src/tests/system/luks2/run_tests.sh
+@@ -23,6 +23,7 @@ for variant in o2 asan; do
+ 	sh "$HERE/build_host.sh" "$W/$variant" $flags
+ 	"$W/$variant/crypto_test" vectors
+ 	python3 -I "$HERE/crypto_crosscheck.py" "$W/$variant/crypto_test" 40
++	sh "$HERE/safety_test.sh" "$CS" "$W/$variant/luks" "$W/$variant"
+ 	rm -rf "$W/cryptsetup-$variant"
+ 	mkdir "$W/cryptsetup-$variant"
+ 	sh "$HERE/cryptsetup_test.sh" "$CS" "$W/$variant/luks" \
+diff --git a/src/tests/system/luks2/safety_test.sh b/src/tests/system/luks2/safety_test.sh
+new file mode 100644
+index 0000000..f347346
+--- /dev/null
++++ b/src/tests/system/luks2/safety_test.sh
+@@ -0,0 +1,73 @@
++#!/bin/sh
++# Copyright 2026, haiku-odroid-c2 port authors.
++# Distributed under the terms of the MIT License.
++#
++# Destructive-command guards, on disposable host image files only.
++# Usage: safety_test.sh <cryptsetup> <luks> <work directory>
++set -eu
++CS=$1
++LUKS=$2
++mkdir -p "$3"
++W=$(mktemp -d "$3/safety.XXXXXX")
++cd "$W"
++printf 'first review passphrase' > k0
++printf 'second review passphrase' > k1
++passed=0
++ok() { passed=$((passed + 1)); echo "ok   $*"; }
++fail() { echo "FAIL $*"; exit 1; }
++cs() { "$CS" -q --disable-locks "$@"; }
++format() {
++	truncate -s 32M "$1"
++	"$LUKS" format -y -k k0 --pbkdf pbkdf2 --iterations 1000 "$1" > /dev/null
++}
++refuse_unchanged() {
++	image=$1
++	shift
++	before=$(sha256sum < "$image")
++	if "$@" > command.log 2>&1; then
++		cat command.log
++		fail "unexpected success: $*"
++	fi
++	[ "$(sha256sum < "$image")" = "$before" ] || fail "changed $image: $*"
++}
++
++format unsupported.img
++cs luksAddKey --key-file k0 --pbkdf pbkdf2 --hash sha1 \
++	--pbkdf-force-iterations 1000 unsupported.img k1
++refuse_unchanged unsupported.img "$LUKS" removekey -k k0 unsupported.img 0
++"$LUKS" test -k k0 unsupported.img > /dev/null
++ok "an unsupported remaining slot cannot replace the last usable slot"
++"$LUKS" removekey --force -k k0 unsupported.img 0 > /dev/null
++cs open --test-passphrase --key-file k1 unsupported.img
++ok "force still permits deliberate removal; cryptsetup opens the remaining slot"
++
++format ignored.img
++cs luksAddKey --key-file k0 --pbkdf pbkdf2 --hash sha256 \
++	--pbkdf-force-iterations 1000 ignored.img k1
++cs config --priority ignore --key-slot 1 ignored.img
++refuse_unchanged ignored.img "$LUKS" removekey -k k0 ignored.img 0
++"$LUKS" test -k k0 ignored.img > /dev/null
++ok "an ignored remaining slot cannot replace the last automatically tried slot"
++cs config --priority normal --key-slot 1 ignored.img
++"$LUKS" removekey -k k0 ignored.img 0 > /dev/null
++"$LUKS" test -k k1 ignored.img > /dev/null
++ok "removing a slot with a usable replacement still works"
++
++format source.img
++ln source.img hardlink.img
++ln -s source.img symlink.img
++for output in source.img hardlink.img symlink.img; do
++	refuse_unchanged source.img "$LUKS" read -k k0 source.img "$output"
++	"$LUKS" test -k k0 source.img > /dev/null
++	ok "read refuses $output without truncating the encrypted source"
++done
++
++dd if=/dev/urandom of=pattern.bin bs=512 count=1 2>/dev/null
++"$LUKS" write -k k0 source.img pattern.bin
++truncate -s 40M output.bin
++"$LUKS" read -k k0 source.img output.bin
++[ "$(wc -c < output.bin)" -eq 16777216 ] || fail "output wasn't truncated"
++head -c 512 output.bin > first-sector.bin
++cmp pattern.bin first-sector.bin || fail "decrypted output differs"
++ok "read still replaces an unrelated output file and decrypts correctly"
++echo "$passed passed, 0 failed"
+-- 
+2.53.0
+

@@ -6,7 +6,7 @@ stages:
   passphrase (x86_64, tested in QEMU), patches 0001-0003;
 - encrypted volumes from Haiku itself (EncryptedVolume, Tracker,
   DriveSetup, Installer), patch 0004;
-- the fixes from two reviews, patches 0005 and 0007;
+- the fixes from reviews, patches 0005, 0007 and 0017;
 - the fixes from the first tries on real hardware, patches 0008, 0010 and
   0011;
 - two fixes outside the LUKS code, found on the way, patches 0012 and 0013;
@@ -179,10 +179,13 @@ bus, like `ram_disk`, and is in the boot module set:
   size is the segment's sector size, and its size is the segment's.
   - Reads and writes go to the underlying partition, which the driver
     keeps open, through a fixed pool of bounce buffers, so the page writer
-    never needs an allocation.
+    never needs an allocation. User buffers are faulted in and wired before
+    taking a volume lock or bounce buffer: a page fault may itself need to
+    read the same encrypted volume. Kernel buffers skip this step.
   - Unaligned access is handled by read-modify-write under a lock.
-  - `B_FLUSH_DRIVE_CACHE` is passed down. Discards are not, since they would
-    reveal which blocks are in use.
+  - `B_FLUSH_DRIVE_CACHE` is passed down for devices; regular file backing
+    uses `fsync()` and propagates failures. Discards are not, since they
+    would reveal which blocks are in use.
 - **Keys:** the driver checks every key it's given against the LUKS2
   digest. It doesn't run Argon2: userland and the loader do.
 - **Removable:** the decrypted device says it's removable, and
@@ -476,6 +479,32 @@ changes since then needed something of their own:
   the UI test, which has four disks. The scan now locks the window. That
   bug is in stock Haiku.
 
+## Driver and command review (patch 0017)
+
+Codex reviewed the code after patch 0016 on 2026-11-13. Four fixes are
+included, with regression tests for the reproduced failures:
+
+| Finding | Fix and evidence |
+|---|---|
+| A user-buffer page fault could need another read from the same encrypted volume while holding a bounce buffer. Concurrent reads exhausted all four buffers and deadlocked. | Wire user buffers before acquiring the volume lock or a bounce buffer. In an x86_64 QEMU test, the original driver completed 0 of 16 concurrent reads into cold private file mappings; the fixed driver completed 16 of 16. Kernel I/O buffers keep the allocation-free path. |
+| Flushing a file-backed volume used a device ioctl and treated its unsupported result as success. | Use `fsync()` for regular files, retry interrupted calls and return failures. Confirmed by code inspection; no physical power-loss test was performed. |
+| `removekey` counted unsupported and priority-ignored slots as replacements for the last usable slot. | Count supported, bound, non-ignored slots; require `--force` otherwise. Host tests cover both refusals, intentional forced removal and normal replacement. |
+| `luks read image image` truncated the encrypted source when opening its output; hard links and symlinks had the same problem. | Compare the opened file identities before truncation or copying. Host tests verify each refusal leaves the encrypted image unchanged and that an unrelated output is still replaced correctly. |
+
+A simpler single-thread partial-write hypothesis did not reproduce: Haiku
+permits the writer thread to acquire the read lock recursively. The confirmed
+deadlock above requires exhausting the shared resources during page faults.
+
+Patch 0017 validation: the driver and CLI cross-compiled and linked for
+x86_64; the native memory-test helper compiled with `-Werror`. The optimized
+host interoperability/crash suite passed 69 of 69 checks. The eight new
+command-safety checks passed both optimized and ASan/UBSan builds. The
+sanitizer run used `ASAN_OPTIONS=detect_leaks=0` because LeakSanitizer could
+not run in this traced environment; leak checking is not covered by that
+run. The unchanged crypto vectors and 226 randomized comparisons also
+passed in both builds. The full boot, Installer and arm64 suites were not
+rerun for this patch.
+
 ## Tested
 
 All in QEMU (x86_64, UEFI/OVMF, NVMe) and on the build host, unless it says
@@ -496,7 +525,7 @@ late October 2026). On `master` a8694efb7c (2026-11-12), on 2026-11-13:
     too long. The guest carries on, but the test can't see its result.
     Patch 0016 puts the tests' serial port on a file instead of a socket,
     which avoids it.
-- **All 16 patches:** the boot test passed 19 of 19, and the loader test
+- **Patches 0001–0016:** the boot test passed 19 of 19, and the loader test
   8 of 8. The UI test's live system passed its 25 checks, and so did the
   host's checks of Installer's EFI loader and the partition type. The
   installed disk's first boot hung after package_daemon's "is consistent"
@@ -583,7 +612,7 @@ late October 2026). On `master` a8694efb7c (2026-11-12), on 2026-11-13:
 ## Known risks and limits
 
 - **No person has reviewed the crypto and LUKS2 code.** It passes the
-  vectors and the cryptsetup tests, and the two AI reviews found and got
+  vectors and the cryptsetup tests, and the AI reviews found and got
   fixed the problems listed above. Keep backups of anything on an
   encrypted volume.
 - **The ESP isn't protected.** The EFI system partition and the loader are

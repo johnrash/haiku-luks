@@ -22,13 +22,13 @@ The code is new and written for Haiku from the LUKS2 specification and the
 RFCs. It's all MIT-licensed.
 
 > **Not reviewed by a person.** The crypto and LUKS2 code has passed test
-> vectors, interoperability tests with cryptsetup, fuzzing and two AI
+> vectors, interoperability tests with cryptsetup, fuzzing and AI
 > reviews, but no person who knows cryptography has reviewed it. Keep
 > backups of anything you put on an encrypted volume.
 
-> **AI-written.** These patches were written with Claude, Anthropic's AI
-> model, working for the repository's owner; the commits say so
-> (`Co-Authored-By: Claude`). **Haiku does not accept AI-generated
+> **AI-written.** Patches 0001–0016 were written with Claude, Anthropic's AI
+> model; patch 0017 was reviewed and written with OpenAI's Codex, working
+> for the repository's owner. **Haiku does not accept AI-generated
 > contributions**, so please don't submit these patches, or code derived
 > from them, to Haiku.
 
@@ -81,9 +81,9 @@ Be File System mounted at `/boot`:
 
 ## The patches
 
-[`patches/`](patches) holds 16 `git format-patch` files for Haiku's
+[`patches/`](patches) holds 17 `git format-patch` files for Haiku's
 `master` branch, made on top of `a8694efb7c` (2026-11-12). Together they
-change 78 files, most of them new.
+change 84 files, most of them new.
 
 | Patch | What |
 |---|---|
@@ -103,6 +103,7 @@ change 78 files, most of them new.
 | 0014 | Test fix: the EFI loader is in `/boot/system` on current `master` |
 | 0015 | DriveSetup: lock the window while scanning the disks (stock `master` dropped into the debugger) |
 | 0016 | Test fix: the QEMU tests' serial console is a file, not a socket (on a socket, Haiku's kernel sometimes turned its serial output off) |
+| 0017 | Driver: prevent page faults from exhausting bounce buffers; flush file-backed volumes. Tool: protect the last usable keyslot and refuse copying onto the encrypted source. Host and QEMU regression tests |
 
 Patches 0008, 0010, 0012, 0013 and 0015 fix bugs in stock Haiku that the
 encryption work ran into, outside the LUKS code. An encrypted install

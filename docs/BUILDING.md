@@ -3,8 +3,10 @@
 The patches in [`../patches`](../patches) are `git format-patch` files for
 Haiku's `master` branch. They were made on top of commit
 `a8694efb7c64c84072a83d405531bed559680bb8` ("PCI: Cleanup ReadConfig and
-WriteConfig methods.", 2026-11-12). That tree, with all 16 patches, builds
-an x86_64 image with no compiler warnings in the files they change. Its
+WriteConfig methods.", 2026-11-12). Patches 0001–0016 built
+an x86_64 image with no compiler warnings in the files they change. Patch
+0017's driver, command and regression helper were cross-compiled and
+tested in that image with the updated package. Its
 results in the tests below are in [`DESIGN.md`](DESIGN.md) ("Tested"). The
 QEMU tests also run into a deadlock of stock Haiku now and then (end of
 section 4).
@@ -124,6 +126,11 @@ sh $T/qemu/run-driver-test.sh $IMAGE /tmp/luks-driver $CS $LUKS $BFS
 sh $T/qemu/run-boot-test.sh $IMAGE $LOADER /tmp/luks-boot $LUKS $BFS $CS
 sh $T/qemu/run-ui-test.sh $IMAGE /tmp/luks-ui $BFS
 sh $T/qemu/run-loader-disk-test.sh $IMAGE $LOADER /tmp/luks-loader $BFS
+
+# Driver page-fault regression: the work directory must be new
+(cd $G && jam -q luks2_driver_memory_test)
+MEMORY=$PWD/$G/objects/haiku/x86_64/release/tests/system/luks2/luks2_driver_memory_test
+python3 $T/qemu/run-memory-test.py $IMAGE /tmp/luks-memory $BFS $MEMORY
 ```
 
 Each test prints `ok` and `FAIL` lines and a summary, and keeps its logs in
@@ -131,6 +138,11 @@ its work directory. QEMU runs in software emulation (`-cpu max` emulates
 AES-NI), so a boot takes about a minute. The work directories need a few
 GiB, and the QEMU tests' socket paths must be short: use short work
 directory names.
+
+The memory test starts sixteen reads into cold file-backed mappings on the
+same encrypted volume. Before patch 0017 they exhausted the four bounce
+buffers and stalled; with the fix all sixteen complete. This is a separate
+driver bug from the stock Haiku boot hang below.
 
 **A hang in stock Haiku.** Now and then a QEMU boot stops shortly after
 package_daemon's "is consistent" lines, with every CPU idle, and the test

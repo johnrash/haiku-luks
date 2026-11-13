@@ -146,7 +146,9 @@ luks write <device> <file>     encrypt a file into the data area
     `--key-size` the key size (512 or 256 bits).
   - `--pbkdf argon2id|argon2i|pbkdf2`, `--iter-time ms`, `--memory KiB`,
     `--parallel n`, `--time n` and `--iterations n` set the KDF.
-  - `-r` opens read-only. `--force` allows removing the last keyslot.
+  - `-r` opens read-only. `--force` allows removing the last keyslot Haiku
+    can try automatically. Unsupported or priority-ignored slots do not
+    count as replacements for that check.
     `-y` doesn't ask before formatting.
 - **Locking:** a command that changes a volume takes an exclusive lock on
   the device. A second command on the same volume is refused instead of
